@@ -1,7 +1,7 @@
 """ABI OOH Stage 6 nationwide beta: DMA-driven, state-sharded, review-only OSM screening.
 No inventory is written to GitHub. Every outcome requires human review.
 """
-import gzip, hashlib, html, io, json, math, time
+import gzip, hashlib, html, io, json, math, time, re, unicodedata
 from collections import Counter
 from datetime import datetime, timezone
 import folium
@@ -61,18 +61,109 @@ def latest_index(all_releases):
             if a['name']=='dma-state-index.json':return a['id']
     return None
 
-# Upload first: market controls appear after the grid has been read.
-file=st.file_uploader('1. Upload placement inventory (CSV or XLSX)',type=['csv','xlsx'])
-if file is None:
-    st.info('Upload your grid to begin.');st.stop()
+def normalized_market(value):
+    text=unicodedata.normalize('NFKD',str(value)).encode('ascii','ignore').decode().lower()
+    text=re.sub(r'\bd\.\s*c\.?', 'dc', text)
+    text=re.sub(r'\bsaint\b','st',text)
+    text=re.sub(r'\bft\.?\b','fort',text)
+    text=re.sub(r'\b(designated market area|dma|market)\b',' ',text)
+    return re.sub(r'[^a-z0-9]+',' ',text).strip()
+
+
+def market_column_names(frame):
+    priority=['dmacode','dmaid','dmanumber','dma','dmaname','designatedmarketarea',
+              'designatedmarketareaname','market','marketname','mediamarket','marketdma']
+    ranking={name:i for i,name in enumerate(priority)}
+    columns=[(ranking[key],i,c) for i,c in enumerate(frame.columns)
+             if (key:=re.sub(r'[^a-z0-9]','',str(c).lower())) in ranking]
+    return [c for _,_,c in sorted(columns)]
+
+
+def read_inventory_grids(files):
+    frames=[];all_columns=set()
+    for upload in files:
+        blob=io.BytesIO(upload.getvalue())
+        frame=(pd.read_excel(blob,dtype=object) if upload.name.lower().endswith('.xlsx')
+               else pd.read_csv(blob,dtype=object,encoding='utf-8-sig'))
+        if frame.empty:raise ValueError(f'{upload.name}: empty inventory')
+        def find(names):return next((c for c in frame.columns if str(c).strip().lower() in names),None)
+        lat=find({'latitude','lat'});lon=find({'longitude','lon','lng','long'})
+        if lat is None or lon is None:raise ValueError(f'{upload.name}: Latitude and Longitude columns required')
+        frames.append((upload.name,frame,lat,lon,market_column_names(frame)))
+        all_columns.update(frame.columns)
+    def unique(base):
+        name=base;n=2
+        while name in all_columns:name=f'{base}_{n}';n+=1
+        all_columns.add(name);return name
+    meta={key:unique(base) for key,base in [('file','source_grid'),('row','source_excel_row'),
+          ('lat','screening_latitude'),('lon','screening_longitude'),
+          ('market','source_market'),('market_column','source_market_column')]}
+    combined=[];summaries=[]
+    for filename,frame,lat,lon,market_columns in frames:
+        frame=frame.copy()
+        frame[meta['file']]=filename;frame[meta['row']]=range(2,len(frame)+2)
+        frame[meta['lat']]=frame[lat];frame[meta['lon']]=frame[lon]
+        values=[];origins=[]
+        for _,row in frame.iterrows():
+            candidates=[c for c in market_columns if pd.notna(row[c]) and str(row[c]).strip()]
+            column=candidates[0] if candidates else None
+            values.append(str(row[column]).strip() if column is not None else '')
+            origins.append(str(column) if column is not None else '')
+        frame[meta['market']]=values;frame[meta['market_column']]=origins
+        combined.append(frame)
+        summaries.append({'Grid':filename,'Placements':len(frame),'Market columns':', '.join(map(str,market_columns)) or 'None found'})
+    return pd.concat(combined,ignore_index=True,sort=False),meta,summaries
+
+
+def suggest_market_dmas(values,names):
+    aliases={}
+    def add(alias,code):
+        key=normalized_market(alias)
+        if key:aliases.setdefault(key,set()).add(code)
+    for code,name in names.items():
+        add(name,code)
+        # Common grids abbreviate the official DMA to its first city.
+        primary=re.split(r'[-–—]',name.split(',')[0])[0].strip()
+        add(primary,code)
+        # Preserve state-qualified city names used in shorter market labels.
+        state_match=re.search(r',\s*([A-Z]{2})(?=[^A-Za-z]|$)',name)
+        if state_match:add(primary+' '+state_match.group(1),code)
+    matched=set();review=[]
+    for value,count in values.fillna('').astype(str).value_counts(dropna=False).items():
+        raw=value.strip();key=normalized_market(raw)
+        numeric=re.fullmatch(r'(?:dma\s*)?(\d{3})(?:\.0)?',raw,re.I)
+        if numeric and numeric.group(1) in names:
+            candidates={numeric.group(1)}
+        else:
+            code_suffix=re.search(r'\((\d{3})\)\s*$',raw)
+            if code_suffix and code_suffix.group(1) in names:
+                candidates={code_suffix.group(1)}
+            else:candidates=aliases.get(key,set())
+        if len(candidates)==1:
+            code=next(iter(candidates));matched.add(code)
+            review.append({'Grid market':raw or '(blank)','Placements':int(count),'Detected DMA':names[code],'Match':'Matched'})
+        elif candidates:
+            review.append({'Grid market':raw,'Placements':int(count),'Detected DMA':'; '.join(names[k] for k in sorted(candidates)),'Match':'Ambiguous — select manually'})
+        else:
+            review.append({'Grid market':raw or '(blank)','Placements':int(count),'Detected DMA':'','Match':'No match — select manually'})
+    return matched,review
+
+
+# Upload first; all grids are combined without dropping repeated placements.
+files=st.file_uploader('1. Upload placement grids (CSV or XLSX)',type=['csv','xlsx'],accept_multiple_files=True)
+if not files:
+    st.info('Upload one or more grids to begin.');st.stop()
 try:
-    df=pd.read_excel(file,dtype=object) if file.name.lower().endswith('.xlsx') else pd.read_csv(file,dtype=object,encoding='utf-8-sig')
-    if df.empty:raise ValueError('Empty inventory')
-    def col(names):return next((c for c in df.columns if str(c).strip().lower() in names),None)
-    lat_col=col({'latitude','lat'});lon_col=col({'longitude','lon','lng','long'})
-    if lat_col is None or lon_col is None:raise ValueError('Latitude and Longitude columns required')
+    df,inventory_meta,grid_summaries=read_inventory_grids(files)
+    lat_col=inventory_meta['lat'];lon_col=inventory_meta['lon']
 except Exception as exc:st.error(f'Inventory error: {exc}');st.stop()
-st.caption(f'Grid loaded: {len(df):,} placements.')
+grid_digest=hashlib.sha256()
+for upload in files:
+    grid_digest.update(upload.name.encode('utf-8'));grid_digest.update(hashlib.sha256(upload.getvalue()).digest())
+inventory_key=grid_digest.hexdigest()
+st.caption(f'{len(files)} grid(s) loaded: {len(df):,} placements total. Source filenames are included in exports.')
+with st.expander('Uploaded grids'):
+    st.dataframe(pd.DataFrame(grid_summaries),hide_index=True)
 
 @st.cache_resource(show_spinner=False, max_entries=1)
 def geographic_index(repo,asset_id,token):
@@ -99,15 +190,34 @@ except Exception as exc:st.error(f'Cannot load Stage 6 geographic index: {exc}')
 dma_names={code:f['properties']['name'] for code,f in dma_features.items()}
 labels={f'{dma_names[k]} ({k})':k for k in sorted(dma_names,key=lambda k:dma_names[k])}
 
+suggested_codes,market_review=suggest_market_dmas(df[inventory_meta['market']],dma_names)
+suggested_labels=[label for label,code in labels.items() if code in suggested_codes]
+settings_context=(inventory_key,idx_id)
+if st.session_state.get('stage6_inventory_context')!=settings_context:
+    # New grids or a newly published boundary index must invalidate old settings/results.
+    st.session_state.pop('stage6_settings',None)
+    st.session_state['stage6_dma_selection']=suggested_labels
+    st.session_state['stage6_distance']=500
+    st.session_state['stage6_inventory_context']=settings_context
+st.caption(f'Automatically selected {len(suggested_labels)} DMA(s) from grid market columns. Confirm or edit below.')
+unmatched=[r for r in market_review if r['Match']!='Matched']
+if unmatched:
+    count=sum(r['Placements'] for r in unmatched)
+    st.warning(f'{count:,} placement(s) have missing, ambiguous or unrecognized market names. Review the matches and select any additional DMAs manually.')
+with st.expander('Review market detection',expanded=bool(unmatched)):
+    st.dataframe(pd.DataFrame(market_review),hide_index=True)
+    st.caption('Matching uses market names/codes, not geocoded addresses. Placement coordinates are still checked against your confirmed DMA selection.')
+
 # Batch market edits: selecting or searching does not rerun the Python app.
 with st.form('campaign_settings'):
-    selected_labels=st.multiselect('2. Campaign DMAs (select one or more)',list(labels),default=[])
-    restriction=st.radio('Restricted distance',options=[500,250],horizontal=True,format_func=lambda x:f'{x} feet')
+    selected_labels=st.multiselect('2. Confirm campaign DMAs',list(labels),key='stage6_dma_selection')
+    restriction=st.radio('Restricted distance',options=[500,250],horizontal=True,
+                         format_func=lambda x:f'{x} feet',key='stage6_distance')
     apply_settings=st.form_submit_button('Apply campaign settings',type='primary')
 if apply_settings:
     st.session_state['stage6_settings']=(selected_labels,restriction)
 if 'stage6_settings' not in st.session_state:
-    st.info('Choose your markets and distance, then click Apply campaign settings.');st.stop()
+    st.info('Confirm your markets and distance, then click Apply campaign settings.');st.stop()
 selected_labels,restriction=st.session_state['stage6_settings']
 if not selected_labels:
     st.info('Select at least one DMA and apply campaign settings.');st.stop()
@@ -220,7 +330,7 @@ for slug in sorted(all_needed):
 st.caption(f'Placements: {len(df):,} · Required state datasets: {", ".join(state_names[s] for s in sorted(all_needed)) or "none"}')
 if missing:st.error('Missing state snapshots: '+', '.join(state_names[s] for s in missing)+'. Placements requiring these states will be GRAY, not GREEN.')
 
-fingerprint=(file.name,hashlib.sha256(file.getvalue()).hexdigest(),tuple(sorted(chosen)),restriction,tuple(sorted((k,v['tag']) for k,v in available.items())))
+fingerprint=(inventory_key,tuple(sorted(chosen)),restriction,tuple(sorted((k,v['tag']) for k,v in available.items())))
 if st.button('Run nationwide screening',type='primary'):
     start=time.perf_counter(); datasets={};load_errors={}
     # Bound the indexed area to actual inventory plus a conservative ~2km envelope.
