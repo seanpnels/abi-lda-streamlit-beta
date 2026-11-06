@@ -61,27 +61,10 @@ def latest_index(all_releases):
             if a['name']=='dma-state-index.json':return a['id']
     return None
 
-try:
-    rels=releases(REPO,TOKEN)
-    idx_id=latest_index(rels)
-    if idx_id is None:
-        st.error('Stage 6 DMA index not published yet. Run Stage 6 - Build 209 DMA and state index in the data repo.');st.stop()
-    idx=json.loads(asset_bytes(REPO,idx_id,TOKEN))
-    dmas=idx['dma']['features'];states=idx['states']['features']
-    if len(dmas)!=209 or len(states)!=51:raise ValueError('Incomplete DMA/state index')
-except Exception as exc:st.error(f'Cannot load Stage 6 geographic index: {exc}');st.stop()
-
-# Load only the states needed by actual placement coordinates, including cross-border candidates.
-state_geoms={f['properties']['slug']:shape(f['geometry']) for f in states}
-state_names={f['properties']['slug']:f['properties']['name'] for f in states}
-dma_geoms={str(f['properties']['id']):shape(f['geometry']) for f in dmas}
-dma_names={str(f['properties']['id']):f['properties']['name'] for f in dmas}
-labels={f'{dma_names[k]} ({k})':k for k in sorted(dma_names,key=lambda k:dma_names[k])}
-selected_labels=st.multiselect('Campaign DMAs (select one or more)',list(labels),default=[],help='All 209 DMAs available. Only states needed by uploaded coordinates are loaded.')
-restriction=st.radio('Restricted distance',options=[250,500],horizontal=True,format_func=lambda x:f'{x} feet')
-st.caption(f'Review band: {restriction}–{restriction+50} ft. State coverage is checked per placement, including near borders.')
-file=st.file_uploader('Upload placement inventory (CSV or XLSX)',type=['csv','xlsx'])
-if not selected_labels or file is None:st.info('Choose DMA(s) and upload inventory to begin.');st.stop()
+# Upload first: market controls appear after the grid has been read.
+file=st.file_uploader('1. Upload placement inventory (CSV or XLSX)',type=['csv','xlsx'])
+if file is None:
+    st.info('Upload your grid to begin.');st.stop()
 try:
     df=pd.read_excel(file,dtype=object) if file.name.lower().endswith('.xlsx') else pd.read_csv(file,dtype=object,encoding='utf-8-sig')
     if df.empty:raise ValueError('Empty inventory')
@@ -89,6 +72,48 @@ try:
     lat_col=col({'latitude','lat'});lon_col=col({'longitude','lon','lng','long'})
     if lat_col is None or lon_col is None:raise ValueError('Latitude and Longitude columns required')
 except Exception as exc:st.error(f'Inventory error: {exc}');st.stop()
+st.caption(f'Grid loaded: {len(df):,} placements.')
+
+@st.cache_resource(show_spinner=False, max_entries=1)
+def geographic_index(repo,asset_id,token):
+    # Parse the large national index once per published version, not per rerun.
+    data=json.loads(asset_bytes(repo,asset_id,token))
+    dmas=data['dma']['features'];states=data['states']['features']
+    if len(dmas)!=209 or len(states)!=51:raise ValueError('Incomplete DMA/state index')
+    return ({str(f['properties']['id']):f for f in dmas},
+            {f['properties']['slug']:shape(f['geometry']) for f in states},
+            {f['properties']['slug']:f['properties']['name'] for f in states})
+
+@st.cache_resource(show_spinner=False, max_entries=209)
+def selected_dma_geometry(repo,asset_id,token,code):
+    features,_,_=geographic_index(repo,asset_id,token)
+    return shape(features[code]['geometry'])
+
+try:
+    rels=releases(REPO,TOKEN)
+    idx_id=latest_index(rels)
+    if idx_id is None:
+        st.error('Stage 6 DMA index not published yet.');st.stop()
+    dma_features,state_geoms,state_names=geographic_index(REPO,idx_id,TOKEN)
+except Exception as exc:st.error(f'Cannot load Stage 6 geographic index: {exc}');st.stop()
+dma_names={code:f['properties']['name'] for code,f in dma_features.items()}
+labels={f'{dma_names[k]} ({k})':k for k in sorted(dma_names,key=lambda k:dma_names[k])}
+
+# Batch market edits: selecting or searching does not rerun the Python app.
+with st.form('campaign_settings'):
+    selected_labels=st.multiselect('2. Campaign DMAs (select one or more)',list(labels),default=[])
+    restriction=st.radio('Restricted distance',options=[500,250],horizontal=True,format_func=lambda x:f'{x} feet')
+    apply_settings=st.form_submit_button('Apply campaign settings',type='primary')
+if apply_settings:
+    st.session_state['stage6_settings']=(selected_labels,restriction)
+if 'stage6_settings' not in st.session_state:
+    st.info('Choose your markets and distance, then click Apply campaign settings.');st.stop()
+selected_labels,restriction=st.session_state['stage6_settings']
+if not selected_labels:
+    st.info('Select at least one DMA and apply campaign settings.');st.stop()
+st.caption('Applied markets: '+', '.join(selected_labels))
+st.caption(f'Applied distance: {restriction} feet. Review band: {restriction}–{restriction+50} ft.')
+dma_geoms={labels[x]:selected_dma_geometry(REPO,idx_id,TOKEN,labels[x]) for x in selected_labels}
 
 AMENITIES={'school':'school','kindergarten':'daycare','childcare':'daycare','place_of_worship':'worship','college':'university','university':'university'}
 BUILDINGS={'school':'school','kindergarten':'daycare','church':'worship','chapel':'worship','mosque':'worship','synagogue':'worship','temple':'worship','college':'university','university':'university'}
