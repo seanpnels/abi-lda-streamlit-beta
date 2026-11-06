@@ -9,7 +9,7 @@ from folium.plugins import MeasureControl
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit_folium import st_folium
+import streamlit.components.v1 as components
 from openpyxl.styles import PatternFill, Font
 from shapely.geometry import Point, box, shape
 from shapely.ops import transform
@@ -269,12 +269,12 @@ priority=[x for x in ('screening_status','distance_ft','nearby_facility','facili
 st.dataframe(res[priority+[x for x in res if x not in priority]],use_container_width=True,hide_index=True)
 a,b=st.columns(2)
 with a:st.download_button('Download color-coded Excel',excel_bytes(res),'ABI_Stage6_screening.xlsx')
-with b:st.download_button('Download My Maps CSV',res.to_csv(index=False).encode('utf-8-sig'),'ABI_Stage6_MyMaps.csv')
+with b:st.download_button('Download screening CSV',res.to_csv(index=False).encode('utf-8-sig'),'ABI_Stage6_screening.csv')
 st.subheader('Review map')
 map_rows=[(lat,lon,r) for (lat,lon,_,_),(_,r) in zip(points,res.iterrows()) if lat is not None]
 if map_rows:
     center=[sum(x[0] for x in map_rows)/len(map_rows),sum(x[1] for x in map_rows)/len(map_rows)]
-    m=folium.Map(location=center,zoom_start=10,tiles=None,control_scale=True)
+    m=folium.Map(location=center,zoom_start=10,tiles=None,control_scale=True,height=600,width='100%')
     url=st.secrets.get('CARTO_TILE_URL','');key=st.secrets.get('CARTO_API_KEY','')
     if '{api_key}' in url:url=url.replace('{api_key}',key) if key else ''
     if url:folium.TileLayer(tiles=url,attr='CARTO / OpenStreetMap contributors',name='CARTO dark').add_to(m)
@@ -285,6 +285,8 @@ if map_rows:
         status=str(r['screening_status']); color=colors.get(status.split(' — ')[0],'gray')
         popup=html.escape(status)+'<br>Distance: '+html.escape(str(r['distance_ft']))+' ft<br>Facility: '+html.escape(str(r['nearby_facility'])[:150])
         folium.CircleMarker([lat,lon],radius=6,color=color,fill=True,fill_opacity=.85,popup=folium.Popup(popup,max_width=350)).add_to(m)
-    st_folium(m,height=530,width=None,returned_objects=[])
+    # Explicit heights on both Leaflet and its iframe prevent a collapsed map.
+    # Pan, zoom, popups and measuring stay in the browser without app reruns.
+    components.html(m.get_root().render(),height=620,scrolling=False)
     if len(map_rows)>1000:st.caption('Map displays first 1,000 placements; exports include all.')
 st.caption('Coverage: 50 US states + DC, subject to successful state builds. Territories are not yet supported. OSM incompleteness, missing footprints and facility classifications require manual review for ALL statuses.')
