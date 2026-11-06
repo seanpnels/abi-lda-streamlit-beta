@@ -170,6 +170,23 @@ def load_filtered_state(repo,asset_id,manifest_id,token,bbox_tuple):
     if errors or total<100:raise RuntimeError(f'Invalid dataset: {total} candidates, {errors} parse errors')
     return features,STRtree([f['geom'] for f in features]) if features else None,manifest
 
+def facility_pin_location(geometry):
+    """Use the mapped point, or an interior point of the mapped facility area."""
+    if geometry.is_empty:
+        return None, None
+    point=geometry if geometry.geom_type=='Point' else geometry.representative_point()
+    return float(point.y), float(point.x)
+
+
+def triggering_facility(near, status):
+    if not near:
+        return None
+    # A nearer unverified point must not replace the polygon that caused RED.
+    if status.startswith('RED'):
+        return next((item for item in near if item[1]['quality']=='polygon_unverified'),None)
+    return near[0]
+
+
 def excel_bytes(result):
     out=io.BytesIO()
     with pd.ExcelWriter(out,engine='openpyxl') as writer:
@@ -220,7 +237,8 @@ if st.button('Run nationwide screening',type='primary'):
     results=[]
     for lat,lon,needs,error in points:
         rec={'screening_status':'GRAY — Unable to screen','distance_ft':None,'nearby_facility':'',
-             'facility_category':'','osm_id':'','geometry_quality':'','screening_notes':'Human review required',
+             'facility_category':'','osm_id':'','geometry_quality':'',
+             'facility_latitude':None,'facility_longitude':None,'screening_notes':'Human review required',
              'state_snapshots':''}
         if error:rec['screening_notes']=error;results.append(rec);continue
         bad=[s for s in needs if s not in datasets]
@@ -249,9 +267,13 @@ if st.button('Run nationwide screening',type='primary'):
         rec['screening_status']=status
         rec['state_snapshots']='; '.join(f'{s}: {available[s]["tag"]}' for s in needs)
         rec['screening_notes']='OSM candidate screening only; human review required.'
-        if near:
-            d,f=near[0];rec.update({'distance_ft':round(d/0.3048,1),'nearby_facility':f['name'],
-                'facility_category':'; '.join(f['cats']),'osm_id':f['osm_id'],'geometry_quality':f['quality']})
+        trigger=triggering_facility(near,status)
+        if trigger:
+            d,f=trigger
+            facility_lat,facility_lon=facility_pin_location(f['geom'])
+            rec.update({'distance_ft':round(d/0.3048,1),'nearby_facility':f['name'],
+                'facility_category':'; '.join(f['cats']),'osm_id':f['osm_id'],'geometry_quality':f['quality'],
+                'facility_latitude':facility_lat,'facility_longitude':facility_lon})
         results.append(rec)
     st.session_state['stage6_result']=pd.concat([df.reset_index(drop=True),pd.DataFrame(results)],axis=1)
     st.session_state['stage6_fingerprint']=fingerprint
@@ -271,6 +293,7 @@ a,b=st.columns(2)
 with a:st.download_button('Download color-coded Excel',excel_bytes(res),'ABI_Stage6_screening.xlsx')
 with b:st.download_button('Download screening CSV',res.to_csv(index=False).encode('utf-8-sig'),'ABI_Stage6_screening.csv')
 st.subheader('Review map')
+st.caption('Circles mark placements. Pin-shaped markers identify the primary facility behind each red/yellow flag. Facility pins use mapped OSM locations, not verified street addresses.')
 map_rows=[(lat,lon,r) for (lat,lon,_,_),(_,r) in zip(points,res.iterrows()) if lat is not None]
 if map_rows:
     center=[sum(x[0] for x in map_rows)/len(map_rows),sum(x[1] for x in map_rows)/len(map_rows)]
@@ -281,10 +304,24 @@ if map_rows:
     else:folium.TileLayer('CartoDB dark_matter',name='CARTO dark (public tiles)').add_to(m)
     MeasureControl(position='topright',primary_length_unit='feet',secondary_length_unit='miles').add_to(m)
     colors={'RED':'red','YELLOW':'orange','GREEN':'green','GRAY':'gray'}
-    for lat,lon,r in map_rows[:1000]:
+    placement_layer=folium.FeatureGroup(name='Placements').add_to(m)
+    facility_layer=folium.FeatureGroup(name='Flagged facilities').add_to(m)
+    for row_number,(lat,lon,r) in enumerate(map_rows[:1000],start=1):
         status=str(r['screening_status']); color=colors.get(status.split(' — ')[0],'gray')
-        popup=html.escape(status)+'<br>Distance: '+html.escape(str(r['distance_ft']))+' ft<br>Facility: '+html.escape(str(r['nearby_facility'])[:150])
-        folium.CircleMarker([lat,lon],radius=6,color=color,fill=True,fill_opacity=.85,popup=folium.Popup(popup,max_width=350)).add_to(m)
+        popup=f'<b>Placement {row_number}</b><br>'+html.escape(status)+'<br>Distance: '+html.escape(str(r['distance_ft']))+' ft<br>Facility: '+html.escape(str(r['nearby_facility'])[:150])
+        folium.CircleMarker([lat,lon],radius=6,color=color,fill=True,fill_opacity=.85,popup=folium.Popup(popup,max_width=350)).add_to(placement_layer)
+        facility_lat=r.get('facility_latitude');facility_lon=r.get('facility_longitude')
+        if status.startswith(('RED','YELLOW')) and pd.notna(facility_lat) and pd.notna(facility_lon):
+            name=str(r['nearby_facility']).strip() or 'Unnamed mapped facility'
+            facility_popup=(f'<b>Flagged facility for placement {row_number}</b><br>'
+                +html.escape(name)+'<br>'+html.escape(str(r['facility_category']))
+                +'<br>OSM: '+html.escape(str(r['osm_id']))
+                +'<br>Pin marks mapped facility location; measure manually.')
+            folium.Marker([float(facility_lat),float(facility_lon)],
+                icon=folium.Icon(color=color,icon='exclamation-sign',prefix='glyphicon'),
+                tooltip='Flagged facility: '+html.escape(name),
+                popup=folium.Popup(facility_popup,max_width=350)).add_to(facility_layer)
+    folium.LayerControl(collapsed=False).add_to(m)
     # Explicit heights on both Leaflet and its iframe prevent a collapsed map.
     # Pan, zoom, popups and measuring stay in the browser without app reruns.
     components.html(m.get_root().render(),height=620,scrolling=False)
