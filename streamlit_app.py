@@ -83,10 +83,23 @@ class LiveRuler(MacroElement):
         self._name='LiveRuler'
 
 
+STATUS_LABELS={'RED':'Non-Compliant','YELLOW':'Requires Review','GREEN':'Compliant','GRAY':'Unable to Locate'}
+
+def status_code(value):
+    text=str(value)
+    for code,label in STATUS_LABELS.items():
+        if text==label or text==code or text.startswith(code+' — '):return code
+    return 'GRAY'
+
+
+def display_status(value):
+    return STATUS_LABELS[status_code(value)]
+
+
 st.set_page_config(page_title='ABI OOH · Nationwide Beta',page_icon='🗺️',layout='wide')
 st.title('ABI OOH · LDA Compliance Hub')
 st.caption('Stage 6 · 209 DMA architecture · state-sharded OSM datasets · review-only')
-st.warning('**Every placement requires human review.** OSM coverage is incomplete; candidate polygons are not verified building footprints. Green is NOT a compliance determination.')
+st.warning('**Every placement requires human review.** OSM coverage is incomplete; candidate polygons are not verified building footprints. Results are preliminary screening outcomes, not final clearance.')
 try:
     TOKEN=st.secrets.get('GITHUB_TOKEN','')
     REPO=st.secrets.get('GITHUB_REPO','seanpnels/abi-lda-data-poc')
@@ -369,7 +382,7 @@ def google_review_map_records(rows):
     records=[]
     colors={'RED':'#d93025','YELLOW':'#f9ab00','GREEN':'#188038','GRAY':'#80868b'}
     for number,(lat,lon,row) in enumerate(rows[:1000],start=1):
-        status=str(row['screening_status']);flag=status.split(' — ')[0]
+        flag=status_code(row['screening_status']);status=display_status(row['screening_status'])
         popup=(f'<b>Placement {number}</b><br>'+html.escape(status)
                +'<br>Distance: '+html.escape(str(row['distance_ft']))+' ft'
                +'<br>Facility: '+html.escape(str(row['nearby_facility'])[:150]))
@@ -507,17 +520,64 @@ def google_review_component():
     return components.declare_component('lda_google_review',path=str(directory))
 
 
-def excel_bytes(result):
+def flagged_facilities_table(facility_hits):
+    """One importable pin per mapped facility, retaining linked Screening rows."""
+    columns=['Business name','Latitude','Longitude','Status','Category','OSM ID',
+             'Nearest distance (ft)','Matched placement count','Screening worksheet rows',
+             'Source grid rows','Location note']
+    grouped={}
+    for hit in facility_hits:
+        lat=hit['latitude'];lon=hit['longitude']
+        if not (math.isfinite(lat) and math.isfinite(lon)):continue
+        osm_id=str(hit.get('osm_id','')).strip()
+        # Same OSM object across overlapping state extracts is a single facility.
+        identity=('osm',osm_id) if osm_id else ('location',round(lat,7),round(lon,7),hit['name'],hit['category'])
+        if identity not in grouped:
+            grouped[identity]={'Business name':hit['name'] or 'Unnamed mapped facility',
+                'Latitude':lat,'Longitude':lon,'Status':hit['status'],'Category':hit['category'],
+                'OSM ID':osm_id,'Nearest distance (ft)':hit['distance_ft'],
+                '_rows':set(),'_sources':set(),
+                'Location note':'Mapped OSM location; street address not verified. Measure manually.'}
+        record=grouped[identity]
+        if hit['status']=='RED':record['Status']='RED'
+        record['Nearest distance (ft)']=min(record['Nearest distance (ft)'],hit['distance_ft'])
+        record['_rows'].add(hit['screening_row'])
+        record['_sources'].add(f"{hit['source_file']}: row {hit['source_row']}")
+    records=[]
+    for record in grouped.values():
+        rows=record.pop('_rows');sources=record.pop('_sources')
+        record['Matched placement count']=len(rows)
+        record['Screening worksheet rows']=', '.join(map(str,sorted(rows)))
+        record['Source grid rows']='; '.join(sorted(sources))
+        record['Status']=display_status(record['Status'])
+        records.append(record)
+    return pd.DataFrame(records,columns=columns)
+
+
+def excel_bytes(result, facility_hits=None):
     out=io.BytesIO()
     with pd.ExcelWriter(out,engine='openpyxl') as writer:
-        result.to_excel(writer,index=False,sheet_name='Screening')
+        export=result.copy()
+        export['screening_status']=export['screening_status'].map(display_status)
+        export.to_excel(writer,index=False,sheet_name='Screening')
         ws=writer.sheets['Screening'];idx=result.columns.get_loc('screening_status')+1
         colors={'RED':'FCE8E8','YELLOW':'FFF0C2','GREEN':'E2F3E8','GRAY':'E6EAF0'}
         for row in range(2,len(result)+2):
-            key=str(ws.cell(row,idx).value).split(' — ')[0]
+            key=status_code(ws.cell(row,idx).value)
             for cell in ws[row]:cell.fill=PatternFill('solid',fgColor=colors.get(key,'FFFFFF'))
         ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
         for cell in ws[1]:cell.font=Font(bold=True,color='FFFFFF');cell.fill=PatternFill('solid',fgColor='23384B')
+        facilities=flagged_facilities_table(facility_hits or [])
+        facilities.to_excel(writer,index=False,sheet_name='Flagged facilities')
+        ws=writer.sheets['Flagged facilities']
+        ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
+        for cell in ws[1]:cell.font=Font(bold=True,color='FFFFFF');cell.fill=PatternFill('solid',fgColor='23384B')
+        for row in ws.iter_rows(min_row=2):
+            color=colors.get(status_code(row[3].value),'FFFFFF')
+            for cell in row:cell.fill=PatternFill('solid',fgColor=color)
+            row[1].number_format='0.0000000';row[2].number_format='0.0000000'
+        widths={'A':40,'B':17,'C':17,'D':12,'E':28,'F':24,'G':23,'H':25,'I':30,'J':50,'K':65}
+        for column,width in widths.items():ws.column_dimensions[column].width=width
     return out.getvalue()
 
 chosen=[labels[x] for x in selected_labels]
@@ -538,7 +598,7 @@ for slug in sorted(all_needed):
     if release:available[slug]=release
     else:missing.append(slug)
 st.caption(f'Placements: {len(df):,} · Required state datasets: {", ".join(state_names[s] for s in sorted(all_needed)) or "none"}')
-if missing:st.error('Missing state snapshots: '+', '.join(state_names[s] for s in missing)+'. Placements requiring these states will be GRAY, not GREEN.')
+if missing:st.error('Missing state snapshots: '+', '.join(state_names[s] for s in missing)+'. Placements requiring these states will be marked Unable to Locate.')
 
 fingerprint=(inventory_key,tuple(sorted(chosen)),restriction,tuple(sorted((k,v['tag']) for k,v in available.items())))
 if st.button('Run nationwide screening',type='primary'):
@@ -554,8 +614,8 @@ if st.button('Run nationwide screening',type='primary'):
                 if (datetime.now(timezone.utc)-date).total_seconds()>10*86400:raise RuntimeError('Snapshot older than 10 days')
                 datasets[slug]=(feats,tree,manifest)
             except Exception as exc:load_errors[slug]=str(exc)
-    results=[]
-    for lat,lon,needs,error in points:
+    results=[];facility_hits=[]
+    for screening_row,(lat,lon,needs,error) in enumerate(points,start=2):
         rec={'screening_status':'GRAY — Unable to screen','distance_ft':None,'nearby_facility':'',
              'facility_category':'','osm_id':'','geometry_quality':'',
              'facility_latitude':None,'facility_longitude':None,'screening_notes':'Human review required',
@@ -587,6 +647,20 @@ if st.button('Run nationwide screening',type='primary'):
         rec['screening_status']=status
         rec['state_snapshots']='; '.join(f'{s}: {available[s]["tag"]}' for s in needs)
         rec['screening_notes']='OSM candidate screening only; human review required.'
+        # Export every candidate within the review band, not only the primary
+        # facility displayed in the placement row/pin popup.
+        if status.startswith(('RED','YELLOW')):
+            source=df.iloc[screening_row-2]
+            for distance,facility in near:
+                facility_lat,facility_lon=facility_pin_location(facility['geom'])
+                if facility_lat is None or facility_lon is None:continue
+                hit_status=('RED' if facility['quality']=='polygon_unverified'
+                            and distance<=restriction*.3048 else 'YELLOW')
+                facility_hits.append({'name':facility['name'],'latitude':facility_lat,
+                    'longitude':facility_lon,'status':hit_status,'category':'; '.join(facility['cats']),
+                    'osm_id':facility['osm_id'],'distance_ft':round(distance/.3048,1),
+                    'screening_row':screening_row,'source_file':str(source[inventory_meta['file']]),
+                    'source_row':str(source[inventory_meta['row']])})
         trigger=triggering_facility(near,status)
         if trigger:
             d,f=trigger
@@ -599,21 +673,25 @@ if st.button('Run nationwide screening',type='primary'):
     st.session_state['stage6_fingerprint']=fingerprint
     st.session_state['stage6_elapsed']=time.perf_counter()-start
     st.session_state['stage6_errors']=load_errors
+    st.session_state['stage6_facility_hits']=facility_hits
 if st.session_state.get('stage6_fingerprint')!=fingerprint:
     st.info('Run screening to generate results.');st.stop()
 res=st.session_state['stage6_result'];counts=Counter(str(x).split(' — ')[0] for x in res['screening_status'])
 cols=st.columns(5)
-for col,key in zip(cols[:4],('RED','YELLOW','GREEN','GRAY')):col.metric(key,counts.get(key,0))
+for col,key in zip(cols[:4],('RED','YELLOW','GREEN','GRAY')):col.metric(STATUS_LABELS[key],counts.get(key,0))
 cols[4].metric('Processing time',f'{st.session_state["stage6_elapsed"]:.2f}s')
 if st.session_state['stage6_errors']:
     st.error('State data errors: '+ '; '.join(f'{state_names[k]}: {v}' for k,v in st.session_state['stage6_errors'].items()))
 priority=[x for x in ('screening_status','distance_ft','nearby_facility','facility_category','Unit #','Location Description','screening_notes') if x in res]
-st.dataframe(res[priority+[x for x in res if x not in priority]],use_container_width=True,hide_index=True)
+res_display=res.copy()
+res_display['screening_status']=res_display['screening_status'].map(display_status)
+st.dataframe(res_display[priority+[x for x in res_display if x not in priority]],use_container_width=True,hide_index=True)
 a,b=st.columns(2)
-with a:st.download_button('Download color-coded Excel',excel_bytes(res),'ABI_Stage6_screening.xlsx')
-with b:st.download_button('Download screening CSV',res.to_csv(index=False).encode('utf-8-sig'),'ABI_Stage6_screening.csv')
+with a:st.download_button('Download color-coded Excel',excel_bytes(res,st.session_state.get('stage6_facility_hits',[])),'ABI_Stage6_screening.xlsx')
+with b:st.download_button('Download screening CSV',res_display.to_csv(index=False).encode('utf-8-sig'),'ABI_Stage6_screening.csv')
+st.caption('Excel includes a Flagged facilities worksheet with all detected Non-Compliant / Requires Review candidates and importable coordinates. In My Maps, use Latitude/Longitude for location and Business name for the title.')
 st.subheader('Review map')
-st.caption('Circles mark placements. Pin-shaped markers identify the primary facility behind each red/yellow flag. Facility pins use mapped OSM locations, not verified street addresses.')
+st.caption('Circles mark placements. Pin-shaped markers identify the primary facility behind each Non-Compliant / Requires Review flag. Facility pins use mapped OSM locations, not verified street addresses.')
 map_rows=[(lat,lon,r) for (lat,lon,_,_),(_,r) in zip(points,res.iterrows()) if lat is not None]
 if map_rows:
     google_key=st.secrets.get('GOOGLE_MAPS_API_KEY','').strip()
@@ -639,11 +717,11 @@ if map_rows:
         placement_layer=folium.FeatureGroup(name='Placements').add_to(m)
         facility_layer=folium.FeatureGroup(name='Flagged facilities').add_to(m)
         for row_number,(lat,lon,r) in enumerate(map_rows[:1000],start=1):
-            status=str(r['screening_status']); color=colors.get(status.split(' — ')[0],'gray')
+            flag=status_code(r['screening_status']);status=display_status(r['screening_status']);color=colors.get(flag,'gray')
             popup=f'<b>Placement {row_number}</b><br>'+html.escape(status)+'<br>Distance: '+html.escape(str(r['distance_ft']))+' ft<br>Facility: '+html.escape(str(r['nearby_facility'])[:150])
             folium.CircleMarker([lat,lon],radius=6,color=color,fill=True,fill_opacity=.85,popup=folium.Popup(popup,max_width=350)).add_to(placement_layer)
             facility_lat=r.get('facility_latitude');facility_lon=r.get('facility_longitude')
-            if status.startswith(('RED','YELLOW')) and pd.notna(facility_lat) and pd.notna(facility_lon):
+            if flag in ('RED','YELLOW') and pd.notna(facility_lat) and pd.notna(facility_lon):
                 name=str(r['nearby_facility']).strip() or 'Unnamed mapped facility'
                 facility_popup=(f'<b>Flagged facility for placement {row_number}</b><br>'
                     +html.escape(name)+'<br>'+html.escape(str(r['facility_category']))
