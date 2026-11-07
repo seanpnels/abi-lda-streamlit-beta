@@ -96,9 +96,11 @@ def display_status(value):
     return STATUS_LABELS[status_code(value)]
 
 
-st.set_page_config(page_title='ABI OOH · Nationwide Beta',page_icon='🗺️',layout='wide')
-st.title('ABI OOH · LDA Compliance Hub')
-st.caption('Stage 6 · 209 DMA architecture · state-sharded OSM datasets · review-only')
+st.set_page_config(page_title='ABI OOH - LDA Screening Tool',page_icon='🗺️',layout='wide')
+st.title('ABI OOH - LDA Screening Tool')
+st.caption('209 DMA Source: Esri')
+st.caption('Non-Compliant Location Source: OpenStreetMap (OSM)')
+st.markdown('**Instructions:**\n\n1. Upload the MediaX Responses grid\n2. Check DMAs; add any missing\n3. Run Nationwide Screening\n4. Enjoy!')
 st.warning('**Every placement requires human review.** OSM coverage is incomplete; candidate polygons are not verified building footprints. Results are preliminary screening outcomes, not final clearance.')
 try:
     TOKEN=st.secrets.get('GITHUB_TOKEN','')
@@ -229,8 +231,20 @@ def suggest_market_dmas(values,names):
     return matched,review
 
 
+def reset_campaign():
+    next_epoch=st.session_state.get('stage6_upload_epoch',0)+1
+    for key in list(st.session_state):
+        if str(key).startswith(('stage6_','campaign_panel_','google_review_','dma_picker_','dma_distance_')):
+            del st.session_state[key]
+    st.session_state['stage6_upload_epoch']=next_epoch
+
+
+def reset_control():
+    st.button('Reset / Start Over',key='stage6_reset_button',on_click=reset_campaign)
+
+
 # Upload first; all grids are combined without dropping repeated placements.
-files=st.file_uploader('1. Upload placement grids (CSV or XLSX)',type=['csv','xlsx'],accept_multiple_files=True)
+files=st.file_uploader('1. Upload placement grids (CSV or XLSX)',type=['csv','xlsx'],accept_multiple_files=True,key='stage6_files_'+str(st.session_state.get('stage6_upload_epoch',0)))
 if not files:
     st.info('Upload one or more grids to begin.');st.stop()
 try:
@@ -343,7 +357,7 @@ def placement_dma_rule(lon,lat,chosen,geometries,distances,names):
 
 suggested_codes,market_review=suggest_market_dmas(df[inventory_meta['market']],dma_names)
 suggested_labels=[label for label,code in labels.items() if code in suggested_codes]
-settings_context=(inventory_key,idx_id)
+settings_context=(inventory_key,idx_id,st.session_state.get('stage6_upload_epoch',0))
 if st.session_state.get('stage6_inventory_context')!=settings_context:
     # New grids or a newly published boundary index must invalidate old settings/results.
     st.session_state.pop('stage6_settings',None)
@@ -381,7 +395,7 @@ if panel_value is not None:
     except (KeyError,TypeError,ValueError) as exc:
         st.error(f'Campaign settings: {exc}');st.stop()
 if 'stage6_settings' not in st.session_state:
-    st.info('Confirm your markets and distances, then click Apply campaign settings.');st.stop()
+    st.info('Confirm your markets and distances, then click Apply campaign settings.');reset_control();st.stop()
 applied=st.session_state['stage6_settings']
 selected_labels=applied['labels'];dma_distances=applied['distances']
 st.caption('Applied distances: '+ ' · '.join(f'{dma_names[code]}: {distance} ft' for code,distance in dma_distances.items()))
@@ -690,108 +704,126 @@ def excel_bytes(result, facility_hits=None):
         for column,width in widths.items():ws.column_dimensions[column].width=width
     return out.getvalue()
 
-chosen=[labels[x] for x in selected_labels]
-points=[]; point_rules=[];all_needed=set();valid=[]
-for _,r in df.iterrows():
-    rule=None
-    try:
-        lat=float(r[lat_col]);lon=float(r[lon_col]);
-        if not (math.isfinite(lat) and math.isfinite(lon) and -90<=lat<=90 and -180<=lon<=180):raise ValueError('Invalid coordinate')
-        rule=placement_dma_rule(lon,lat,chosen,dma_geoms,dma_distances,dma_names)
-        needs=needed_states(lon,lat)
-        if not needs:raise ValueError('No matching state geometry / unsupported territory')
-        points.append((lat,lon,needs,''));all_needed.update(needs);valid.append((lat,lon))
-    except Exception as exc:points.append((None,None,[],str(exc)))
-    point_rules.append(rule)
+run_clicked=st.button('Run Nationwide Screening',type='primary')
+progress=st.status('Screening in progress… Checking placement coordinates',state='running',expanded=True) if run_clicked else None
+try:
+    chosen=[labels[x] for x in selected_labels]
+    points=[]; point_rules=[];all_needed=set();valid=[]
+    for _,r in df.iterrows():
+        rule=None
+        try:
+            lat=float(r[lat_col]);lon=float(r[lon_col]);
+            if not (math.isfinite(lat) and math.isfinite(lon) and -90<=lat<=90 and -180<=lon<=180):raise ValueError('Invalid coordinate')
+            rule=placement_dma_rule(lon,lat,chosen,dma_geoms,dma_distances,dma_names)
+            needs=needed_states(lon,lat)
+            if not needs:raise ValueError('No matching state geometry / unsupported territory')
+            points.append((lat,lon,needs,''));all_needed.update(needs);valid.append((lat,lon))
+        except Exception as exc:points.append((None,None,[],str(exc)))
+        point_rules.append(rule)
 
-available={};missing=[]
-for slug in sorted(all_needed):
-    release=latest_asset(rels,f'stage6-osm-{slug}-','facilities.geojsonseq.gz')
-    if release:available[slug]=release
-    else:missing.append(slug)
-st.caption(f'Placements: {len(df):,} · Required state datasets: {", ".join(state_names[s] for s in sorted(all_needed)) or "none"}')
-if missing:st.error('Missing state snapshots: '+', '.join(state_names[s] for s in missing)+'. Placements requiring these states will be marked Unable to Locate.')
+    if progress:progress.write(f'Coordinate checks complete: {len(valid):,} of {len(df):,} placements located in the selected DMAs.')
+    available={};missing=[]
+    for slug in sorted(all_needed):
+        release=latest_asset(rels,f'stage6-osm-{slug}-','facilities.geojsonseq.gz')
+        if release:available[slug]=release
+        else:missing.append(slug)
+    st.caption(f'Placements: {len(df):,} · Required state datasets: {", ".join(state_names[s] for s in sorted(all_needed)) or "none"}')
+    if missing:st.error('Missing state snapshots: '+', '.join(state_names[s] for s in missing)+'. Placements requiring these states will be marked Unable to Locate.')
 
-fingerprint=(inventory_key,tuple(sorted(dma_distances.items())),tuple(sorted((k,v['tag']) for k,v in available.items())))
-if st.button('Run nationwide screening',type='primary'):
-    start=time.perf_counter(); datasets={};load_errors={}
-    # Bound the indexed area to actual inventory plus a conservative ~2km envelope.
-    if valid:
-        bounds=(min(p[1] for p in valid)-.04,min(p[0] for p in valid)-.04,
-                max(p[1] for p in valid)+.04,max(p[0] for p in valid)+.04)
-        for slug,rel in available.items():
-            try:
-                feats,tree,manifest=load_filtered_state(REPO,rel['file_id'],rel['manifest_id'],TOKEN,bounds)
-                date=datetime.fromisoformat(str(manifest['generated_utc']).replace('Z','+00:00'))
-                if (datetime.now(timezone.utc)-date).total_seconds()>10*86400:raise RuntimeError('Snapshot older than 10 days')
-                datasets[slug]=(feats,tree,manifest)
-            except Exception as exc:load_errors[slug]=str(exc)
-    results=[];facility_hits=[]
-    for screening_row,(lat,lon,needs,error) in enumerate(points,start=2):
-        rec={'screening_status':'GRAY — Unable to screen','distance_ft':None,'nearby_facility':'',
-             'facility_category':'','osm_id':'','geometry_quality':'',
-             'facility_latitude':None,'facility_longitude':None,'screening_notes':'Human review required',
-             'state_snapshots':'','matched_dma':'','applied_distance_ft':None}
-        rule=point_rules[screening_row-2]
-        if rule:
-            restriction=rule['distance']
-            rec.update({'matched_dma':rule['dma'],'applied_distance_ft':restriction})
-        if error:rec['screening_notes']=error;results.append(rec);continue
-        bad=[s for s in needs if s not in datasets]
-        if bad:
-            rec['screening_notes']='Missing/stale/failed state coverage: '+', '.join(state_names[s] for s in bad)
-            results.append(rec);continue
-        project=local_projection(lon,lat); p=Point(0,0)
-        radius_m=(restriction+50)*.3048;near=[]
-        for slug in needs:
-            feats,tree,_=datasets[slug]
-            if tree is None:continue
-            # Broad lon/lat envelope; exact final distance is measured in local meters.
-            lat_delta=radius_m/110000*1.15
-            lon_delta=radius_m/(111000*max(.1,math.cos(math.radians(lat))))*1.15
-            search=box(lon-lon_delta,lat-lat_delta,lon+lon_delta,lat+lat_delta)
-            for i in tree.query(search):
-                f=feats[int(i)]
-                try:d=p.distance(transform(project,f['geom']))
-                except Exception:continue
-                if d<=radius_m:near.append((d,f))
-        near.sort(key=lambda item:item[0]);poly=[(d,f) for d,f in near if f['quality']=='polygon_unverified']
-        nonpoly=[(d,f) for d,f in near if f['quality']!='polygon_unverified']
-        if poly and poly[0][0]<=restriction*.3048:status='RED — Potential conflict'
-        elif poly or nonpoly:status='YELLOW — Review required'
-        else:status='GREEN — No detected conflict'
-        rec['screening_status']=status
-        rec['state_snapshots']='; '.join(f'{s}: {available[s]["tag"]}' for s in needs)
-        rec['screening_notes']='OSM candidate screening only; human review required.'+(' '+rule['note'] if rule['note'] else '')
-        # Export every candidate within the review band, not only the primary
-        # facility displayed in the placement row/pin popup.
-        if status.startswith(('RED','YELLOW')):
-            source=df.iloc[screening_row-2]
-            for distance,facility in near:
-                facility_lat,facility_lon=facility_pin_location(facility['geom'])
-                if facility_lat is None or facility_lon is None:continue
-                hit_status=('RED' if facility['quality']=='polygon_unverified'
-                            and distance<=restriction*.3048 else 'YELLOW')
-                facility_hits.append({'name':facility['name'],'latitude':facility_lat,
-                    'longitude':facility_lon,'status':hit_status,'category':'; '.join(facility['cats']),
-                    'osm_id':facility['osm_id'],'distance_ft':round(distance/.3048,1),
-                    'screening_row':screening_row,'applied_distance_ft':restriction,'source_file':str(source[inventory_meta['file']]),
-                    'source_row':str(source[inventory_meta['row']])})
-        trigger=triggering_facility(near,status)
-        if trigger:
-            d,f=trigger
-            facility_lat,facility_lon=facility_pin_location(f['geom'])
-            rec.update({'distance_ft':round(d/0.3048,1),'nearby_facility':f['name'],
-                'facility_category':'; '.join(f['cats']),'osm_id':f['osm_id'],'geometry_quality':f['quality'],
-                'facility_latitude':facility_lat,'facility_longitude':facility_lon})
-        results.append(rec)
-    st.session_state['stage6_result']=pd.concat([df.reset_index(drop=True),pd.DataFrame(results)],axis=1)
-    st.session_state['stage6_fingerprint']=fingerprint
-    st.session_state['stage6_elapsed']=time.perf_counter()-start
-    st.session_state['stage6_errors']=load_errors
-    st.session_state['stage6_facility_hits']=facility_hits
+    fingerprint=(inventory_key,tuple(sorted(dma_distances.items())),tuple(sorted((k,v['tag']) for k,v in available.items())))
+    if run_clicked:
+        start=time.perf_counter(); datasets={};load_errors={}
+        # Bound the indexed area to actual inventory plus a conservative ~2km envelope.
+        if valid:
+            bounds=(min(p[1] for p in valid)-.04,min(p[0] for p in valid)-.04,
+                    max(p[1] for p in valid)+.04,max(p[0] for p in valid)+.04)
+            for slug,rel in available.items():
+                progress.update(label=f'Loading {state_names[slug]} data…',state='running')
+                try:
+                    feats,tree,manifest=load_filtered_state(REPO,rel['file_id'],rel['manifest_id'],TOKEN,bounds)
+                    date=datetime.fromisoformat(str(manifest['generated_utc']).replace('Z','+00:00'))
+                    if (datetime.now(timezone.utc)-date).total_seconds()>10*86400:raise RuntimeError('Snapshot older than 10 days')
+                    datasets[slug]=(feats,tree,manifest)
+                    progress.write(f'{state_names[slug]} data ready.')
+                except Exception as exc:
+                    load_errors[slug]=str(exc)
+                    progress.write(f'{state_names[slug]} data unavailable; affected placements will be marked Unable to Locate.')
+        progress.update(label=f'Checking {len(points):,} placements…',state='running')
+        results=[];facility_hits=[]
+        for screening_row,(lat,lon,needs,error) in enumerate(points,start=2):
+            checked=screening_row-1
+            if checked==1 or checked%25==0 or checked==len(points):
+                progress.update(label=f'Checking placements: {checked:,} of {len(points):,}',state='running')
+            rec={'screening_status':'GRAY — Unable to screen','distance_ft':None,'nearby_facility':'',
+                 'facility_category':'','osm_id':'','geometry_quality':'',
+                 'facility_latitude':None,'facility_longitude':None,'screening_notes':'Human review required',
+                 'state_snapshots':'','matched_dma':'','applied_distance_ft':None}
+            rule=point_rules[screening_row-2]
+            if rule:
+                restriction=rule['distance']
+                rec.update({'matched_dma':rule['dma'],'applied_distance_ft':restriction})
+            if error:rec['screening_notes']=error;results.append(rec);continue
+            bad=[s for s in needs if s not in datasets]
+            if bad:
+                rec['screening_notes']='Missing/stale/failed state coverage: '+', '.join(state_names[s] for s in bad)
+                results.append(rec);continue
+            project=local_projection(lon,lat); p=Point(0,0)
+            radius_m=(restriction+50)*.3048;near=[]
+            for slug in needs:
+                feats,tree,_=datasets[slug]
+                if tree is None:continue
+                # Broad lon/lat envelope; exact final distance is measured in local meters.
+                lat_delta=radius_m/110000*1.15
+                lon_delta=radius_m/(111000*max(.1,math.cos(math.radians(lat))))*1.15
+                search=box(lon-lon_delta,lat-lat_delta,lon+lon_delta,lat+lat_delta)
+                for i in tree.query(search):
+                    f=feats[int(i)]
+                    try:d=p.distance(transform(project,f['geom']))
+                    except Exception:continue
+                    if d<=radius_m:near.append((d,f))
+            near.sort(key=lambda item:item[0]);poly=[(d,f) for d,f in near if f['quality']=='polygon_unverified']
+            nonpoly=[(d,f) for d,f in near if f['quality']!='polygon_unverified']
+            if poly and poly[0][0]<=restriction*.3048:status='RED — Potential conflict'
+            elif poly or nonpoly:status='YELLOW — Review required'
+            else:status='GREEN — No detected conflict'
+            rec['screening_status']=status
+            rec['state_snapshots']='; '.join(f'{s}: {available[s]["tag"]}' for s in needs)
+            rec['screening_notes']='OSM candidate screening only; human review required.'+(' '+rule['note'] if rule['note'] else '')
+            # Export every candidate within the review band, not only the primary
+            # facility displayed in the placement row/pin popup.
+            if status.startswith(('RED','YELLOW')):
+                source=df.iloc[screening_row-2]
+                for distance,facility in near:
+                    facility_lat,facility_lon=facility_pin_location(facility['geom'])
+                    if facility_lat is None or facility_lon is None:continue
+                    hit_status=('RED' if facility['quality']=='polygon_unverified'
+                                and distance<=restriction*.3048 else 'YELLOW')
+                    facility_hits.append({'name':facility['name'],'latitude':facility_lat,
+                        'longitude':facility_lon,'status':hit_status,'category':'; '.join(facility['cats']),
+                        'osm_id':facility['osm_id'],'distance_ft':round(distance/.3048,1),
+                        'screening_row':screening_row,'applied_distance_ft':restriction,'source_file':str(source[inventory_meta['file']]),
+                        'source_row':str(source[inventory_meta['row']])})
+            trigger=triggering_facility(near,status)
+            if trigger:
+                d,f=trigger
+                facility_lat,facility_lon=facility_pin_location(f['geom'])
+                rec.update({'distance_ft':round(d/0.3048,1),'nearby_facility':f['name'],
+                    'facility_category':'; '.join(f['cats']),'osm_id':f['osm_id'],'geometry_quality':f['quality'],
+                    'facility_latitude':facility_lat,'facility_longitude':facility_lon})
+            results.append(rec)
+        progress.update(label='Preparing results and downloads…',state='running')
+        st.session_state['stage6_result']=pd.concat([df.reset_index(drop=True),pd.DataFrame(results)],axis=1)
+        st.session_state['stage6_fingerprint']=fingerprint
+        st.session_state['stage6_elapsed']=time.perf_counter()-start
+        st.session_state['stage6_errors']=load_errors
+        st.session_state['stage6_facility_hits']=facility_hits
+        progress.update(label='Screening complete',state='complete',expanded=False)
+except Exception as exc:
+    if progress:progress.update(label='Screening stopped — please review the error below',state='error',expanded=True)
+    st.error(f'Unable to complete screening: {exc}')
+    reset_control();st.stop()
 if st.session_state.get('stage6_fingerprint')!=fingerprint:
-    st.info('Run screening to generate results.');st.stop()
+    st.info('Run screening to generate results.');reset_control();st.stop()
 res=st.session_state['stage6_result'];counts=Counter(str(x).split(' — ')[0] for x in res['screening_status'])
 st.markdown(result_summary_html(counts),unsafe_allow_html=True)
 if st.session_state['stage6_errors']:
@@ -849,3 +881,6 @@ if map_rows:
     if len(map_rows)>1000 and google_key:
         st.caption('Map displays first 1,000 placements; exports include all.')
 st.caption('Coverage: 50 US states + DC, subject to successful state builds. Territories are not yet supported. OSM incompleteness, missing footprints and facility classifications require manual review for ALL statuses.')
+
+st.divider()
+reset_control()
