@@ -1,7 +1,8 @@
 """ABI OOH Stage 6 nationwide beta: DMA-driven, state-sharded, review-only OSM screening.
 No inventory is written to GitHub. Every outcome requires human review.
 """
-import gzip, hashlib, html, io, json, math, time, re, unicodedata
+import gzip, hashlib, html, io, json, math, time, re, unicodedata, tempfile
+from pathlib import Path
 from collections import Counter
 from datetime import datetime, timezone
 import folium
@@ -363,7 +364,7 @@ def triggering_facility(near, status):
     return near[0]
 
 
-def google_review_map_html(rows, api_key):
+def google_review_map_records(rows):
     """Render one Google map; markers and ruler operate within its browser iframe."""
     records=[]
     colors={'RED':'#d93025','YELLOW':'#f9ab00','GREEN':'#188038','GRAY':'#80868b'}
@@ -384,9 +385,11 @@ def google_review_map_html(rows, api_key):
                          +'<br>OSM: '+html.escape(str(row['osm_id']))
                          +'<br>Mapped facility location; measure manually.')}
         records.append(record)
-    def safe_json(value):
-        return json.dumps(value,allow_nan=False).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
-    template=r'''<!doctype html>
+    return records
+
+
+
+GOOGLE_REVIEW_COMPONENT_HTML=r'''<!doctype html>
 <html><head><meta charset="utf-8"><meta name="referrer" content="strict-origin-when-cross-origin">
 <style>
 html,body{margin:0;padding:0;height:100%;font:13px Arial,sans-serif;color:#17212b}
@@ -398,7 +401,8 @@ html,body{margin:0;padding:0;height:100%;font:13px Arial,sans-serif;color:#17212
 </style></head><body>
 <div id="map"></div><div id="message" role="alert"></div>
 <script>
-const records=__RECORDS__;
+let records=[];
+let componentStarted=false;
 function showError(text){const box=document.getElementById('message');box.textContent=text;box.style.display='block';}
 window.gm_authFailure=function(){showError('Google Maps rejected the key. Check Maps JavaScript API, billing and the allowed website. Keep website restrictions enabled.');};
 window.initReviewMap=function(){
@@ -474,11 +478,33 @@ window.initReviewMap=function(){
   else map.setZoom(16);
  }catch(error){showError('Map initialization failed: '+error.message);console.error(error);}
 };
-const loader=document.createElement('script');
-loader.src='https://maps.googleapis.com/maps/api/js?'+new URLSearchParams({key:__KEY__,v:'quarterly',loading:'async',libraries:'geometry',callback:'initReviewMap'}).toString();
-loader.async=true;loader.onerror=()=>showError('Google Maps could not load. Check your connection or browser content blocker.');document.head.appendChild(loader);
+function sendToStreamlit(type, extra) {
+ window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*');
+}
+window.addEventListener('message',function(event) {
+ if(event.source!==window.parent || !event.data || event.data.type!=='streamlit:render')return;
+ sendToStreamlit('streamlit:setFrameHeight',{height:620});
+ if(componentStarted)return;
+ const args=event.data.args||{};
+ if(!Array.isArray(args.records)||!args.records.length)return;
+ if(!args.api_key){showError('Google Maps key missing.');return;}
+ componentStarted=true;records=args.records;
+ const loader=document.createElement('script');
+ loader.src='https://maps.googleapis.com/maps/api/js?'+new URLSearchParams({key:args.api_key,v:'quarterly',loading:'async',libraries:'geometry',callback:'initReviewMap'}).toString();
+ loader.async=true;loader.onerror=()=>showError('Google Maps could not load. Check your connection or browser content blocker.');document.head.appendChild(loader);
+});
+sendToStreamlit('streamlit:componentReady',{apiVersion:1});
+sendToStreamlit('streamlit:setFrameHeight',{height:620});
 </script></body></html>'''
-    return template.replace('__RECORDS__',safe_json(records)).replace('__KEY__',safe_json(api_key))
+
+
+@st.cache_resource(show_spinner=False)
+def google_review_component():
+    # Serve a real HTTP component URL. A srcdoc iframe cannot satisfy Google's
+    # website referrer restrictions in Safari (it reports about:srcdoc).
+    directory=Path(tempfile.mkdtemp(prefix='lda_google_map_'))
+    (directory/'index.html').write_text(GOOGLE_REVIEW_COMPONENT_HTML,encoding='utf-8')
+    return components.declare_component('lda_google_review',path=str(directory))
 
 
 def excel_bytes(result):
@@ -594,7 +620,10 @@ if map_rows:
     if google_key:
         st.caption('Google Maps business labels appear as you zoom in. Ruler and pin controls run within the map.')
         if st.checkbox('Show Google review map',value=False,key='stage6_show_google_map'):
-            components.html(google_review_map_html(map_rows,google_key),height=620,scrolling=False)
+            map_records=google_review_map_records(map_rows)
+            map_identity=hashlib.sha256((json.dumps(map_records,allow_nan=False)+google_key).encode()).hexdigest()[:20]
+            google_review_component()(records=map_records,api_key=google_key,
+                                      key='google_review_'+map_identity,default=None)
         else:
             st.info('Check Show Google review map when you are ready. Loading or recreating a Google map counts toward your map usage.')
     else:
