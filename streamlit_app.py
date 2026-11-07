@@ -83,12 +83,12 @@ class LiveRuler(MacroElement):
         self._name='LiveRuler'
 
 
-STATUS_LABELS={'RED':'Non-Compliant','YELLOW':'Requires Review','GREEN':'Compliant','GRAY':'Unable to Locate'}
+STATUS_LABELS={'RED':'Non-Compliant','YELLOW':'Needs Review','GREEN':'Compliant','GRAY':'Unable to Locate'}
 
 def status_code(value):
     text=str(value)
     for code,label in STATUS_LABELS.items():
-        if text==label or text==code or text.startswith(code+' — '):return code
+        if text==label or (code=='YELLOW' and text=='Requires Review') or text==code or text.startswith(code+' — '):return code
     return 'GRAY'
 
 
@@ -270,6 +270,58 @@ except Exception as exc:st.error(f'Cannot load Stage 6 geographic index: {exc}')
 dma_names={code:f['properties']['name'] for code,f in dma_features.items()}
 labels={f'{dma_names[k]} ({k})':k for k in sorted(dma_names,key=lambda k:dma_names[k])}
 
+MARKET_PICKER_HTML=r'''<!doctype html><html><head><meta charset="utf-8"><style>
+*{box-sizing:border-box}html,body{margin:0;font:14px Arial,sans-serif;background:transparent;color:var(--text,#eef3f8)}
+#field{border:1px solid #667080;border-radius:7px;background:var(--bg,#172331);padding:8px}
+#chips{height:64px;overflow:auto;display:flex;gap:5px;flex-wrap:wrap;margin-bottom:5px}
+.chip{background:#20bda9;color:#07231e;border:0;border-radius:5px;padding:5px 7px;cursor:pointer;font:inherit}
+#search{width:100%;border:0;background:transparent;color:inherit;outline:none;padding:5px;font:inherit}
+#results{height:216px;overflow-y:auto;border:1px solid #667080;border-top:0;border-radius:0 0 7px 7px;background:var(--bg,#172331)}
+.option{width:100%;display:flex;align-items:center;gap:8px;text-align:left;background:transparent;color:inherit;border:0;border-bottom:1px solid #59647444;padding:9px;cursor:pointer;font:inherit}
+.option:hover,.option:focus{background:#20bda933}.option[aria-selected=true]{background:#20bda91a}
+#summary{font-size:12px;padding:7px 0;color:inherit}#results:empty:before{content:'No matching markets';display:block;padding:12px}
+</style></head><body><div id="field"><div id="chips"></div><input id="search" type="search" placeholder="Search markets; click to add or remove" aria-label="Search campaign DMAs" autocomplete="off"></div><div id="results" role="listbox" aria-label="Campaign DMAs" aria-multiselectable="true"></div><div id="summary"></div>
+<script>
+let options=[],selected=new Set(),initialized=false;
+const search=document.getElementById('search'),results=document.getElementById('results'),chips=document.getElementById('chips'),summary=document.getElementById('summary');
+function send(type,extra){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*');}
+function toggle(value){if(selected.has(value))selected.delete(value);else selected.add(value);render();send('streamlit:setComponentValue',{value:options.filter(x=>selected.has(x.value)).map(x=>x.value),dataType:'json'});}
+function render(){
+ chips.replaceChildren();
+ options.filter(x=>selected.has(x.value)).forEach(option=>{const chip=document.createElement('button');chip.className='chip';chip.type='button';chip.textContent=option.label+' ×';chip.setAttribute('aria-label','Remove '+option.label);chip.onclick=()=>toggle(option.value);chips.appendChild(chip);});
+ results.replaceChildren();
+ const query=search.value.trim().toLowerCase();
+ options.filter(x=>x.label.toLowerCase().includes(query)).forEach(option=>{const button=document.createElement('button');button.type='button';button.className='option';button.setAttribute('role','option');button.setAttribute('aria-selected',String(selected.has(option.value)));button.textContent=(selected.has(option.value)?'☑ ':'☐ ')+option.label;button.onclick=()=>toggle(option.value);results.appendChild(button);});
+ summary.textContent=selected.size+' market(s) selected. The list stays below the search field.';
+}
+search.addEventListener('input',render);
+search.addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();const first=results.querySelector('button');if(first)first.click();}});
+window.addEventListener('message',event=>{
+ if(event.source!==window.parent||!event.data||event.data.type!=='streamlit:render')return;
+ const args=event.data.args||{};
+ if(event.data.theme){document.documentElement.style.setProperty('--bg',event.data.theme.secondaryBackgroundColor||'#172331');document.documentElement.style.setProperty('--text',event.data.theme.textColor||'#eef3f8');}
+ if(!initialized){options=args.options||[];const allowed=new Set(options.map(x=>x.value));selected=new Set((args.initial_selected||[]).filter(x=>allowed.has(x)));initialized=true;render();}
+ send('streamlit:setFrameHeight',{height:380});
+});
+send('streamlit:componentReady',{apiVersion:1});send('streamlit:setFrameHeight',{height:380});
+</script></body></html>'''
+
+
+@st.cache_resource(show_spinner=False)
+def market_picker_component():
+    directory=Path(tempfile.mkdtemp(prefix='lda_market_picker_'))
+    (directory/'index.html').write_text(MARKET_PICKER_HTML,encoding='utf-8')
+    return components.declare_component('lda_market_picker',path=str(directory))
+
+
+def placement_dma_rule(lon,lat,chosen,geometries,distances,names):
+    matches=[code for code in chosen if geometries[code].covers(Point(lon,lat))]
+    if not matches:raise ValueError('Outside selected DMA boundary')
+    return {'dma':'; '.join(names[code] for code in matches),
+            'distance':max(distances[code] for code in matches),
+            'note':'Multiple DMA boundaries matched; larger distance applied.' if len(matches)>1 else ''}
+
+
 suggested_codes,market_review=suggest_market_dmas(df[inventory_meta['market']],dma_names)
 suggested_labels=[label for label,code in labels.items() if code in suggested_codes]
 settings_context=(inventory_key,idx_id)
@@ -277,7 +329,7 @@ if st.session_state.get('stage6_inventory_context')!=settings_context:
     # New grids or a newly published boundary index must invalidate old settings/results.
     st.session_state.pop('stage6_settings',None)
     st.session_state['stage6_dma_selection']=suggested_labels
-    st.session_state['stage6_distance']=500
+    st.session_state['stage6_dma_distances']={code:500 for code in dma_names}
     st.session_state['stage6_inventory_context']=settings_context
 st.caption(f'Automatically selected {len(suggested_labels)} DMA(s) from grid market columns. Confirm or edit below.')
 unmatched=[r for r in market_review if r['Match']!='Matched']
@@ -288,22 +340,41 @@ with st.expander('Review market detection',expanded=bool(unmatched)):
     st.dataframe(pd.DataFrame(market_review),hide_index=True)
     st.caption('Matching uses market names/codes, not geocoded addresses. Placement coordinates are still checked against your confirmed DMA selection.')
 
-# Batch market edits: selecting or searching does not rerun the Python app.
+st.markdown('**2. Confirm campaign DMAs**')
+picker_values=market_picker_component()(
+    options=[{'value':code,'label':label} for label,code in labels.items()],
+    initial_selected=[labels[label] for label in st.session_state['stage6_dma_selection'] if label in labels],
+    key='dma_picker_'+hashlib.sha256(str(settings_context).encode()).hexdigest()[:16],default=None)
+if picker_values is not None:
+    selected_set={str(code) for code in picker_values if str(code) in dma_names}
+    st.session_state['stage6_dma_selection']=[label for label,code in labels.items() if code in selected_set]
+draft_labels=st.session_state['stage6_dma_selection']
+draft_codes=[labels[label] for label in draft_labels]
+previous=st.session_state.get('stage6_settings')
+if not isinstance(previous,dict) or previous.get('labels')!=draft_labels:
+    st.session_state.pop('stage6_settings',None)
+if not draft_codes:
+    st.info('Select at least one DMA above.');st.stop()
 with st.form('campaign_settings'):
-    selected_labels=st.multiselect('2. Confirm campaign DMAs',list(labels),key='stage6_dma_selection')
-    restriction=st.radio('Restricted distance',options=[500,250],horizontal=True,
-                         format_func=lambda x:f'{x} feet',key='stage6_distance')
+    st.markdown('**3. Set distance for each DMA**')
+    draft_distances={}
+    saved_distances=st.session_state['stage6_dma_distances']
+    for code in draft_codes:
+        draft_distances[code]=st.radio(dma_names[code],[500,250],
+            index=0 if saved_distances.get(code,500)==500 else 1,horizontal=True,
+            format_func=lambda value:f'{value} feet',
+            key=f'dma_distance_{inventory_key[:16]}_{code}')
     apply_settings=st.form_submit_button('Apply campaign settings',type='primary')
 if apply_settings:
-    st.session_state['stage6_settings']=(selected_labels,restriction)
+    st.session_state['stage6_dma_distances'].update(draft_distances)
+    st.session_state['stage6_settings']={'labels':list(draft_labels),'distances':dict(draft_distances)}
 if 'stage6_settings' not in st.session_state:
-    st.info('Confirm your markets and distance, then click Apply campaign settings.');st.stop()
-selected_labels,restriction=st.session_state['stage6_settings']
-if not selected_labels:
-    st.info('Select at least one DMA and apply campaign settings.');st.stop()
-st.caption('Applied markets: '+', '.join(selected_labels))
-st.caption(f'Applied distance: {restriction} feet. Review band: {restriction}–{restriction+50} ft.')
-dma_geoms={labels[x]:selected_dma_geometry(REPO,idx_id,TOKEN,labels[x]) for x in selected_labels}
+    st.info('Confirm the distances above, then click Apply campaign settings.');st.stop()
+applied=st.session_state['stage6_settings']
+selected_labels=applied['labels'];dma_distances=applied['distances']
+st.caption('Applied distances: '+ ' · '.join(f'{dma_names[code]}: {distance} ft' for code,distance in dma_distances.items()))
+st.caption('Each placement uses its coordinate-matched DMA distance plus a 50 ft review band.')
+dma_geoms={labels[label]:selected_dma_geometry(REPO,idx_id,TOKEN,labels[label]) for label in selected_labels}
 
 AMENITIES={'school':'school','kindergarten':'daycare','childcare':'daycare','place_of_worship':'worship','college':'university','university':'university'}
 BUILDINGS={'school':'school','kindergarten':'daycare','church':'worship','chapel':'worship','mosque':'worship','synagogue':'worship','temple':'worship','college':'university','university':'university'}
@@ -385,7 +456,9 @@ def google_review_map_records(rows):
         flag=status_code(row['screening_status']);status=display_status(row['screening_status'])
         popup=(f'<b>Placement {number}</b><br>'+html.escape(status)
                +'<br>Distance: '+html.escape(str(row['distance_ft']))+' ft'
-               +'<br>Facility: '+html.escape(str(row['nearby_facility'])[:150]))
+               +'<br>Facility: '+html.escape(str(row['nearby_facility'])[:150])
+               +'<br>DMA: '+html.escape(str(row.get('matched_dma','')))
+               +'<br>Applied distance: '+html.escape(str(row.get('applied_distance_ft','')))+' ft')
         record={'position':{'lat':float(lat),'lng':float(lon)},'color':colors.get(flag,colors['GRAY']),
                 'title':f'Placement {number}: {status}','popup':popup,'facility':None}
         facility_lat=row.get('facility_latitude');facility_lon=row.get('facility_longitude')
@@ -520,11 +593,34 @@ def google_review_component():
     return components.declare_component('lda_google_review',path=str(directory))
 
 
+def result_summary_html(counts):
+    order=[('GREEN','Compliant','#2dd4a6','✓'),('RED','Non-Compliant','#ff777e','!'),
+           ('YELLOW','Needs Review','#f5c45c','?'),('GRAY','Unable to Locate','#a9b5c7','—')]
+    total=sum(counts.get(code,0) for code,_,_,_ in order)
+    cards=[]
+    for code,label,color,icon in order:
+        count=counts.get(code,0);percent=count/total*100 if total else 0
+        cards.append(f'<div class="lda-result-card" style="--status-color:{color}">'
+            f'<div class="lda-card-heading"><span>{label}</span><span class="lda-card-icon">{icon}</span></div>'
+            f'<div class="lda-card-count">{count:,}</div>'
+            f'<div class="lda-card-foot">{percent:.1f}% of placements</div></div>')
+    return ("""<style>
+.lda-result-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin:18px 0 24px}
+.lda-result-card{position:relative;overflow:hidden;background:linear-gradient(135deg,#182638,#101b29);border:1px solid #334155;border-top:4px solid var(--status-color);border-radius:14px;padding:20px 22px;box-shadow:0 5px 18px #0002;color:#f0f5fa}
+.lda-card-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:15px;font-weight:600;color:var(--status-color)}
+.lda-card-icon{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--status-color);border-radius:50%;width:27px;height:27px;flex-shrink:0;font-size:17px}
+.lda-card-count{font-size:42px;font-weight:750;line-height:1.2;letter-spacing:-1px;margin:14px 0 7px;font-variant-numeric:tabular-nums}
+.lda-card-foot{font-size:12px;color:#b4c1d1}
+@media(max-width:1000px){.lda-result-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:480px){.lda-result-grid{grid-template-columns:1fr}}
+</style><div class="lda-result-grid">"""+''.join(cards)+'</div>')
+
+
 def flagged_facilities_table(facility_hits):
     """One importable pin per mapped facility, retaining linked Screening rows."""
     columns=['Business name','Latitude','Longitude','Status','Category','OSM ID',
              'Nearest distance (ft)','Matched placement count','Screening worksheet rows',
-             'Source grid rows','Location note']
+             'Source grid rows','Location note','Applied distance(s) (ft)']
     grouped={}
     for hit in facility_hits:
         lat=hit['latitude'];lon=hit['longitude']
@@ -536,16 +632,18 @@ def flagged_facilities_table(facility_hits):
             grouped[identity]={'Business name':hit['name'] or 'Unnamed mapped facility',
                 'Latitude':lat,'Longitude':lon,'Status':hit['status'],'Category':hit['category'],
                 'OSM ID':osm_id,'Nearest distance (ft)':hit['distance_ft'],
-                '_rows':set(),'_sources':set(),
+                '_rows':set(),'_sources':set(),'_rules':set(),
                 'Location note':'Mapped OSM location; street address not verified. Measure manually.'}
         record=grouped[identity]
         if hit['status']=='RED':record['Status']='RED'
         record['Nearest distance (ft)']=min(record['Nearest distance (ft)'],hit['distance_ft'])
+        if hit.get('applied_distance_ft') is not None:record['_rules'].add(hit['applied_distance_ft'])
         record['_rows'].add(hit['screening_row'])
         record['_sources'].add(f"{hit['source_file']}: row {hit['source_row']}")
     records=[]
     for record in grouped.values():
-        rows=record.pop('_rows');sources=record.pop('_sources')
+        rows=record.pop('_rows');sources=record.pop('_sources');rules=record.pop('_rules')
+        record['Applied distance(s) (ft)']=', '.join(map(str,sorted(rules)))
         record['Matched placement count']=len(rows)
         record['Screening worksheet rows']=', '.join(map(str,sorted(rows)))
         record['Source grid rows']='; '.join(sorted(sources))
@@ -576,21 +674,23 @@ def excel_bytes(result, facility_hits=None):
             color=colors.get(status_code(row[3].value),'FFFFFF')
             for cell in row:cell.fill=PatternFill('solid',fgColor=color)
             row[1].number_format='0.0000000';row[2].number_format='0.0000000'
-        widths={'A':40,'B':17,'C':17,'D':12,'E':28,'F':24,'G':23,'H':25,'I':30,'J':50,'K':65}
+        widths={'A':40,'B':17,'C':17,'D':12,'E':28,'F':24,'G':23,'H':25,'I':30,'J':50,'K':65,'L':28}
         for column,width in widths.items():ws.column_dimensions[column].width=width
     return out.getvalue()
 
 chosen=[labels[x] for x in selected_labels]
-points=[]; all_needed=set();valid=[]
+points=[]; point_rules=[];all_needed=set();valid=[]
 for _,r in df.iterrows():
+    rule=None
     try:
         lat=float(r[lat_col]);lon=float(r[lon_col]);
         if not (math.isfinite(lat) and math.isfinite(lon) and -90<=lat<=90 and -180<=lon<=180):raise ValueError('Invalid coordinate')
-        if not dma_match(lon,lat,chosen):raise ValueError('Outside selected DMA boundary')
+        rule=placement_dma_rule(lon,lat,chosen,dma_geoms,dma_distances,dma_names)
         needs=needed_states(lon,lat)
         if not needs:raise ValueError('No matching state geometry / unsupported territory')
         points.append((lat,lon,needs,''));all_needed.update(needs);valid.append((lat,lon))
     except Exception as exc:points.append((None,None,[],str(exc)))
+    point_rules.append(rule)
 
 available={};missing=[]
 for slug in sorted(all_needed):
@@ -600,7 +700,7 @@ for slug in sorted(all_needed):
 st.caption(f'Placements: {len(df):,} · Required state datasets: {", ".join(state_names[s] for s in sorted(all_needed)) or "none"}')
 if missing:st.error('Missing state snapshots: '+', '.join(state_names[s] for s in missing)+'. Placements requiring these states will be marked Unable to Locate.')
 
-fingerprint=(inventory_key,tuple(sorted(chosen)),restriction,tuple(sorted((k,v['tag']) for k,v in available.items())))
+fingerprint=(inventory_key,tuple(sorted(dma_distances.items())),tuple(sorted((k,v['tag']) for k,v in available.items())))
 if st.button('Run nationwide screening',type='primary'):
     start=time.perf_counter(); datasets={};load_errors={}
     # Bound the indexed area to actual inventory plus a conservative ~2km envelope.
@@ -619,7 +719,11 @@ if st.button('Run nationwide screening',type='primary'):
         rec={'screening_status':'GRAY — Unable to screen','distance_ft':None,'nearby_facility':'',
              'facility_category':'','osm_id':'','geometry_quality':'',
              'facility_latitude':None,'facility_longitude':None,'screening_notes':'Human review required',
-             'state_snapshots':''}
+             'state_snapshots':'','matched_dma':'','applied_distance_ft':None}
+        rule=point_rules[screening_row-2]
+        if rule:
+            restriction=rule['distance']
+            rec.update({'matched_dma':rule['dma'],'applied_distance_ft':restriction})
         if error:rec['screening_notes']=error;results.append(rec);continue
         bad=[s for s in needs if s not in datasets]
         if bad:
@@ -646,7 +750,7 @@ if st.button('Run nationwide screening',type='primary'):
         else:status='GREEN — No detected conflict'
         rec['screening_status']=status
         rec['state_snapshots']='; '.join(f'{s}: {available[s]["tag"]}' for s in needs)
-        rec['screening_notes']='OSM candidate screening only; human review required.'
+        rec['screening_notes']='OSM candidate screening only; human review required.'+(' '+rule['note'] if rule['note'] else '')
         # Export every candidate within the review band, not only the primary
         # facility displayed in the placement row/pin popup.
         if status.startswith(('RED','YELLOW')):
@@ -659,7 +763,7 @@ if st.button('Run nationwide screening',type='primary'):
                 facility_hits.append({'name':facility['name'],'latitude':facility_lat,
                     'longitude':facility_lon,'status':hit_status,'category':'; '.join(facility['cats']),
                     'osm_id':facility['osm_id'],'distance_ft':round(distance/.3048,1),
-                    'screening_row':screening_row,'source_file':str(source[inventory_meta['file']]),
+                    'screening_row':screening_row,'applied_distance_ft':restriction,'source_file':str(source[inventory_meta['file']]),
                     'source_row':str(source[inventory_meta['row']])})
         trigger=triggering_facility(near,status)
         if trigger:
@@ -677,21 +781,19 @@ if st.button('Run nationwide screening',type='primary'):
 if st.session_state.get('stage6_fingerprint')!=fingerprint:
     st.info('Run screening to generate results.');st.stop()
 res=st.session_state['stage6_result'];counts=Counter(str(x).split(' — ')[0] for x in res['screening_status'])
-cols=st.columns(5)
-for col,key in zip(cols[:4],('RED','YELLOW','GREEN','GRAY')):col.metric(STATUS_LABELS[key],counts.get(key,0))
-cols[4].metric('Processing time',f'{st.session_state["stage6_elapsed"]:.2f}s')
+st.markdown(result_summary_html(counts),unsafe_allow_html=True)
 if st.session_state['stage6_errors']:
     st.error('State data errors: '+ '; '.join(f'{state_names[k]}: {v}' for k,v in st.session_state['stage6_errors'].items()))
-priority=[x for x in ('screening_status','distance_ft','nearby_facility','facility_category','Unit #','Location Description','screening_notes') if x in res]
+priority=[x for x in ('screening_status','distance_ft','nearby_facility','facility_category','matched_dma','applied_distance_ft','Unit #','Location Description','screening_notes') if x in res]
 res_display=res.copy()
 res_display['screening_status']=res_display['screening_status'].map(display_status)
 st.dataframe(res_display[priority+[x for x in res_display if x not in priority]],use_container_width=True,hide_index=True)
 a,b=st.columns(2)
 with a:st.download_button('Download color-coded Excel',excel_bytes(res,st.session_state.get('stage6_facility_hits',[])),'ABI_Stage6_screening.xlsx')
 with b:st.download_button('Download screening CSV',res_display.to_csv(index=False).encode('utf-8-sig'),'ABI_Stage6_screening.csv')
-st.caption('Excel includes a Flagged facilities worksheet with all detected Non-Compliant / Requires Review candidates and importable coordinates. In My Maps, use Latitude/Longitude for location and Business name for the title.')
+st.caption('Excel includes a Flagged facilities worksheet with all detected Non-Compliant / Needs Review candidates and importable coordinates. In My Maps, use Latitude/Longitude for location and Business name for the title.')
 st.subheader('Review map')
-st.caption('Circles mark placements. Pin-shaped markers identify the primary facility behind each Non-Compliant / Requires Review flag. Facility pins use mapped OSM locations, not verified street addresses.')
+st.caption('Circles mark placements. Pin-shaped markers identify the primary facility behind each Non-Compliant / Needs Review flag. Facility pins use mapped OSM locations, not verified street addresses.')
 map_rows=[(lat,lon,r) for (lat,lon,_,_),(_,r) in zip(points,res.iterrows()) if lat is not None]
 if map_rows:
     google_key=st.secrets.get('GOOGLE_MAPS_API_KEY','').strip()
