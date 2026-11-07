@@ -271,39 +271,58 @@ dma_names={code:f['properties']['name'] for code,f in dma_features.items()}
 labels={f'{dma_names[k]} ({k})':k for k in sorted(dma_names,key=lambda k:dma_names[k])}
 
 MARKET_PICKER_HTML=r'''<!doctype html><html><head><meta charset="utf-8"><style>
-*{box-sizing:border-box}html,body{margin:0;font:14px Arial,sans-serif;background:transparent;color:var(--text,#eef3f8)}
-#field{border:1px solid #667080;border-radius:7px;background:var(--bg,#172331);padding:8px}
-#chips{height:64px;overflow:auto;display:flex;gap:5px;flex-wrap:wrap;margin-bottom:5px}
-.chip{background:#20bda9;color:#07231e;border:0;border-radius:5px;padding:5px 7px;cursor:pointer;font:inherit}
-#search{width:100%;border:0;background:transparent;color:inherit;outline:none;padding:5px;font:inherit}
-#results{height:216px;overflow-y:auto;border:1px solid #667080;border-top:0;border-radius:0 0 7px 7px;background:var(--bg,#172331)}
-.option{width:100%;display:flex;align-items:center;gap:8px;text-align:left;background:transparent;color:inherit;border:0;border-bottom:1px solid #59647444;padding:9px;cursor:pointer;font:inherit}
-.option:hover,.option:focus{background:#20bda933}.option[aria-selected=true]{background:#20bda91a}
-#summary{font-size:12px;padding:7px 0;color:inherit}#results:empty:before{content:'No matching markets';display:block;padding:12px}
-</style></head><body><div id="field"><div id="chips"></div><input id="search" type="search" placeholder="Search markets; click to add or remove" aria-label="Search campaign DMAs" autocomplete="off"></div><div id="results" role="listbox" aria-label="Campaign DMAs" aria-multiselectable="true"></div><div id="summary"></div>
+*{box-sizing:border-box}html,body{margin:0;background:transparent;font:14px Arial,sans-serif;color:var(--text,#eef3f8)}
+.panel{background:linear-gradient(135deg,#182638,#101b29);border:1px solid #334155;border-top:3px solid #2dd4a6;border-radius:14px;padding:18px 20px;color:#eef3f8}
+.heading{font-size:16px;font-weight:700}.sub{color:#aebdcd;font-size:12px;margin:6px 0 14px}
+#selected{max-height:330px;overflow:auto}.market-row{display:flex;align-items:center;gap:14px;padding:10px 0;border-bottom:1px solid #33415588}
+.market-name{flex:1;min-width:0;font-size:14px;font-weight:500;line-height:1.4}.distance-group{display:flex;border:1px solid #46566b;border-radius:7px;overflow:hidden;flex-shrink:0}
+.distance-group button{font:inherit;padding:7px 12px;background:transparent;color:#b9c6d5;border:0;cursor:pointer;min-width:60px}
+.distance-group button.active{background:#20bda9;color:#052820;font-weight:700}.remove{background:transparent;color:#9eafc3;border:0;font-size:21px;cursor:pointer;padding:3px 6px}.remove:hover{color:#ff777e}
+#add{border:0;background:transparent;color:#2dd4a6;padding:12px 0 5px;font:inherit;cursor:pointer;text-align:left}
+#searchbox{margin-top:10px}#searchbox[hidden]{display:none}
+#search{display:block;width:100%;background:#101b29;color:#eef3f8;border:1px solid #526176;border-radius:7px;padding:10px;font:inherit;outline:none}
+#search:focus{border-color:#2dd4a6}#results{margin-top:4px;max-height:165px;overflow:auto;background:#101b29;border:1px solid #334155;border-radius:7px}
+.option{display:block;width:100%;background:transparent;color:#eef3f8;border:0;text-align:left;padding:10px;font:inherit;cursor:pointer}
+.option:hover,.option:focus{background:#20364b}#empty{color:#aebdcd;font-size:13px;padding:12px 0}
+.footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:15px}.footer span{font-size:12px;color:#aebdcd}
+#apply{background:#20bda9;color:#052820;border:0;border-radius:7px;padding:10px 16px;font:600 13px Arial,sans-serif;cursor:pointer}#apply:disabled{opacity:.45;cursor:default}
+@media(max-width:520px){.panel{padding:14px}.market-row{gap:6px}.market-name{font-size:12px}.distance-group button{padding:7px 8px;min-width:48px}.footer{align-items:flex-start;flex-direction:column}}
+</style></head><body><div class="panel" id="panel"><div class="heading">Campaign markets &amp; distances</div><div class="sub">Confirm your detected markets. Use 500′ by default or select a 250′ exception.</div><div id="selected"></div><button id="add" type="button">+ Add market</button><div id="searchbox" hidden><input id="search" type="search" aria-label="Search markets" placeholder="Type a market name…" autocomplete="off"><div id="results" role="listbox" aria-label="Available markets"></div></div><div class="footer"><span id="summary"></span><button id="apply" type="button">Apply campaign settings</button></div></div>
 <script>
-let options=[],selected=new Set(),initialized=false;
-const search=document.getElementById('search'),results=document.getElementById('results'),chips=document.getElementById('chips'),summary=document.getElementById('summary');
+let options=[],rules={},initialized=false,lastHeight=0;
+const selected=document.getElementById('selected'),add=document.getElementById('add'),searchbox=document.getElementById('searchbox'),search=document.getElementById('search'),results=document.getElementById('results'),summary=document.getElementById('summary'),apply=document.getElementById('apply');
 function send(type,extra){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*');}
-function toggle(value){if(selected.has(value))selected.delete(value);else selected.add(value);render();send('streamlit:setComponentValue',{value:options.filter(x=>selected.has(x.value)).map(x=>x.value),dataType:'json'});}
-function render(){
- chips.replaceChildren();
- options.filter(x=>selected.has(x.value)).forEach(option=>{const chip=document.createElement('button');chip.className='chip';chip.type='button';chip.textContent=option.label+' ×';chip.setAttribute('aria-label','Remove '+option.label);chip.onclick=()=>toggle(option.value);chips.appendChild(chip);});
- results.replaceChildren();
- const query=search.value.trim().toLowerCase();
- options.filter(x=>x.label.toLowerCase().includes(query)).forEach(option=>{const button=document.createElement('button');button.type='button';button.className='option';button.setAttribute('role','option');button.setAttribute('aria-selected',String(selected.has(option.value)));button.textContent=(selected.has(option.value)?'☑ ':'☐ ')+option.label;button.onclick=()=>toggle(option.value);results.appendChild(button);});
- summary.textContent=selected.size+' market(s) selected. The list stays below the search field.';
+function resize(){const height=Math.ceil(document.getElementById('panel').getBoundingClientRect().height)+6;if(height!==lastHeight){lastHeight=height;send('streamlit:setFrameHeight',{height:height});}}
+function filter(){
+ results.replaceChildren();const query=search.value.trim().toLowerCase();
+ const matches=options.filter(option=>!(option.value in rules)&&option.label.toLowerCase().includes(query));
+ matches.forEach(option=>{const button=document.createElement('button');button.type='button';button.className='option';button.setAttribute('role','option');button.textContent=option.label;button.onclick=()=>{rules[option.value]=500;search.value='';searchbox.hidden=true;add.textContent='+ Add market';render();};results.appendChild(button);});
+ if(!matches.length){const empty=document.createElement('div');empty.className='option';empty.textContent='No matching markets';results.appendChild(empty);}
+ resize();
 }
-search.addEventListener('input',render);
-search.addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();const first=results.querySelector('button');if(first)first.click();}});
+function render(){
+ selected.replaceChildren();
+ options.filter(option=>option.value in rules).forEach(option=>{
+  const row=document.createElement('div');row.className='market-row';
+  const name=document.createElement('div');name.className='market-name';name.textContent=option.label;row.appendChild(name);
+  const group=document.createElement('div');group.className='distance-group';group.setAttribute('role','group');group.setAttribute('aria-label',option.label+' distance');
+  [500,250].forEach(distance=>{const button=document.createElement('button');button.type='button';button.className=rules[option.value]===distance?'active':'';button.textContent=distance+'′';button.setAttribute('aria-pressed',String(rules[option.value]===distance));button.onclick=()=>{rules[option.value]=distance;render();};group.appendChild(button);});row.appendChild(group);
+  const remove=document.createElement('button');remove.className='remove';remove.type='button';remove.textContent='×';remove.setAttribute('aria-label','Remove '+option.label);remove.onclick=()=>{delete rules[option.value];render();};row.appendChild(remove);selected.appendChild(row);
+ });
+ if(!Object.keys(rules).length){const empty=document.createElement('div');empty.id='empty';empty.textContent='No markets selected. Add a market below.';selected.appendChild(empty);}
+ const count=Object.keys(rules).length;summary.textContent=count+' market'+(count===1?'':'s')+' selected';apply.disabled=count===0;
+ if(!searchbox.hidden)filter();else resize();
+}
+add.onclick=()=>{searchbox.hidden=!searchbox.hidden;add.textContent=searchbox.hidden?'+ Add market':'− Close search';if(!searchbox.hidden){filter();search.focus();}resize();};
+search.addEventListener('input',filter);
+search.addEventListener('keydown',event=>{if(event.key==='Escape'){searchbox.hidden=true;add.textContent='+ Add market';resize();}if(event.key==='Enter'){event.preventDefault();const first=results.querySelector('button');if(first)first.click();}});
+apply.onclick=()=>send('streamlit:setComponentValue',{value:{distances:Object.assign({},rules),revision:Date.now()},dataType:'json'});
 window.addEventListener('message',event=>{
  if(event.source!==window.parent||!event.data||event.data.type!=='streamlit:render')return;
- const args=event.data.args||{};
- if(event.data.theme){document.documentElement.style.setProperty('--bg',event.data.theme.secondaryBackgroundColor||'#172331');document.documentElement.style.setProperty('--text',event.data.theme.textColor||'#eef3f8');}
- if(!initialized){options=args.options||[];const allowed=new Set(options.map(x=>x.value));selected=new Set((args.initial_selected||[]).filter(x=>allowed.has(x)));initialized=true;render();}
- send('streamlit:setFrameHeight',{height:380});
+ if(!initialized){options=event.data.args.options||[];const initial=event.data.args.initial_rules||{};options.forEach(option=>{if(option.value in initial)rules[option.value]=initial[option.value]===250?250:500;});initialized=true;render();}else resize();
 });
-send('streamlit:componentReady',{apiVersion:1});send('streamlit:setFrameHeight',{height:380});
+window.addEventListener('resize',resize);
+send('streamlit:componentReady',{apiVersion:1});
 </script></body></html>'''
 
 
@@ -311,7 +330,7 @@ send('streamlit:componentReady',{apiVersion:1});send('streamlit:setFrameHeight',
 def market_picker_component():
     directory=Path(tempfile.mkdtemp(prefix='lda_market_picker_'))
     (directory/'index.html').write_text(MARKET_PICKER_HTML,encoding='utf-8')
-    return components.declare_component('lda_market_picker',path=str(directory))
+    return components.declare_component('lda_campaign_panel_v2',path=str(directory))
 
 
 def placement_dma_rule(lon,lat,chosen,geometries,distances,names):
@@ -340,36 +359,29 @@ with st.expander('Review market detection',expanded=bool(unmatched)):
     st.dataframe(pd.DataFrame(market_review),hide_index=True)
     st.caption('Matching uses market names/codes, not geocoded addresses. Placement coordinates are still checked against your confirmed DMA selection.')
 
-st.markdown('**2. Confirm campaign DMAs**')
-picker_values=market_picker_component()(
-    options=[{'value':code,'label':label} for label,code in labels.items()],
-    initial_selected=[labels[label] for label in st.session_state['stage6_dma_selection'] if label in labels],
-    key='dma_picker_'+hashlib.sha256(str(settings_context).encode()).hexdigest()[:16],default=None)
-if picker_values is not None:
-    selected_set={str(code) for code in picker_values if str(code) in dma_names}
-    st.session_state['stage6_dma_selection']=[label for label,code in labels.items() if code in selected_set]
-draft_labels=st.session_state['stage6_dma_selection']
-draft_codes=[labels[label] for label in draft_labels]
-previous=st.session_state.get('stage6_settings')
-if not isinstance(previous,dict) or previous.get('labels')!=draft_labels:
-    st.session_state.pop('stage6_settings',None)
-if not draft_codes:
-    st.info('Select at least one DMA above.');st.stop()
-with st.form('campaign_settings'):
-    st.markdown('**3. Set distance for each DMA**')
-    draft_distances={}
-    saved_distances=st.session_state['stage6_dma_distances']
-    for code in draft_codes:
-        draft_distances[code]=st.radio(dma_names[code],[500,250],
-            index=0 if saved_distances.get(code,500)==500 else 1,horizontal=True,
-            format_func=lambda value:f'{value} feet',
-            key=f'dma_distance_{inventory_key[:16]}_{code}')
-    apply_settings=st.form_submit_button('Apply campaign settings',type='primary')
-if apply_settings:
-    st.session_state['stage6_dma_distances'].update(draft_distances)
-    st.session_state['stage6_settings']={'labels':list(draft_labels),'distances':dict(draft_distances)}
+st.markdown('**2. Campaign settings**')
+initial_selection=st.session_state.get('stage6_dma_selection',suggested_labels)
+initial_rules={labels[label]:st.session_state['stage6_dma_distances'].get(labels[label],500)
+               for label in initial_selection if label in labels}
+panel_value=market_picker_component()(
+    options=[{'value':code,'label':dma_names[code]} for code in labels.values()],
+    initial_rules=initial_rules,
+    key='campaign_panel_v2_'+hashlib.sha256(str(settings_context).encode()).hexdigest()[:16],default=None)
+if panel_value is not None:
+    try:
+        proposed=panel_value['distances']
+        if not isinstance(proposed,dict) or not proposed:raise ValueError('Select at least one market.')
+        if any(code not in dma_names or type(value) is not int or value not in (250,500)
+               for code,value in proposed.items()):raise ValueError('Invalid market distance settings.')
+        selected_labels=[label for label,code in labels.items() if code in proposed]
+        dma_distances={labels[label]:proposed[labels[label]] for label in selected_labels}
+        st.session_state['stage6_dma_selection']=selected_labels
+        st.session_state['stage6_dma_distances'].update(dma_distances)
+        st.session_state['stage6_settings']={'labels':selected_labels,'distances':dma_distances}
+    except (KeyError,TypeError,ValueError) as exc:
+        st.error(f'Campaign settings: {exc}');st.stop()
 if 'stage6_settings' not in st.session_state:
-    st.info('Confirm the distances above, then click Apply campaign settings.');st.stop()
+    st.info('Confirm your markets and distances, then click Apply campaign settings.');st.stop()
 applied=st.session_state['stage6_settings']
 selected_labels=applied['labels'];dma_distances=applied['distances']
 st.caption('Applied distances: '+ ' · '.join(f'{dma_names[code]}: {distance} ft' for code,distance in dma_distances.items()))
@@ -787,7 +799,6 @@ if st.session_state['stage6_errors']:
 priority=[x for x in ('screening_status','distance_ft','nearby_facility','facility_category','matched_dma','applied_distance_ft','Unit #','Location Description','screening_notes') if x in res]
 res_display=res.copy()
 res_display['screening_status']=res_display['screening_status'].map(display_status)
-st.dataframe(res_display[priority+[x for x in res_display if x not in priority]],use_container_width=True,hide_index=True)
 a,b=st.columns(2)
 with a:st.download_button('Download color-coded Excel',excel_bytes(res,st.session_state.get('stage6_facility_hits',[])),'ABI_Stage6_screening.xlsx')
 with b:st.download_button('Download screening CSV',res_display.to_csv(index=False).encode('utf-8-sig'),'ABI_Stage6_screening.csv')
@@ -799,13 +810,10 @@ if map_rows:
     google_key=st.secrets.get('GOOGLE_MAPS_API_KEY','').strip()
     if google_key:
         st.caption('Google Maps business labels appear as you zoom in. Ruler and pin controls run within the map.')
-        if st.checkbox('Show Google review map',value=False,key='stage6_show_google_map'):
-            map_records=google_review_map_records(map_rows)
-            map_identity=hashlib.sha256((json.dumps(map_records,allow_nan=False)+google_key).encode()).hexdigest()[:20]
-            google_review_component()(records=map_records,api_key=google_key,
-                                      key='google_review_'+map_identity,default=None)
-        else:
-            st.info('Check Show Google review map when you are ready. Loading or recreating a Google map counts toward your map usage.')
+        map_records=google_review_map_records(map_rows)
+        map_identity=hashlib.sha256((json.dumps(map_records,allow_nan=False)+google_key).encode()).hexdigest()[:20]
+        google_review_component()(records=map_records,api_key=google_key,
+                                  key='google_review_'+map_identity,default=None)
     else:
         st.info('Add GOOGLE_MAPS_API_KEY in Streamlit Secrets to use Google Maps. Showing the existing CARTO map meanwhile.')
         center=[sum(x[0] for x in map_rows)/len(map_rows),sum(x[1] for x in map_rows)/len(map_rows)]
