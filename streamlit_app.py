@@ -929,8 +929,25 @@ if suggested_additions:
                   for code,count in sorted(suggested_additions.items(),key=lambda item:(-item[1],dma_names[item[0]]))],
                  hide_index=True)
     st.caption('New markets use 500 ft. Previously applied distances stay as set.')
-    st.button('Add suggested markets and rerun screening',
-              on_click=add_suggested_markets_and_rerun,args=(tuple(suggested_additions),))
+    st.markdown('''<style>
+    .st-key-stage6_suggested_rerun_action button {
+        background-color: #ffd166;
+        border-color: #ffd166;
+        color: #111821;
+    }
+    .st-key-stage6_suggested_rerun_action button:hover {
+        background-color: #ffe096;
+        border-color: #ffe096;
+        color: #111821;
+    }
+    .st-key-stage6_suggested_rerun_action button:focus-visible {
+        outline: 2px solid #ffd166;
+        outline-offset: 2px;
+    }
+    </style>''',unsafe_allow_html=True)
+    with st.container(key='stage6_suggested_rerun_action'):
+        st.button('Add suggested markets and rerun screening',
+                  on_click=add_suggested_markets_and_rerun,args=(tuple(suggested_additions),))
 if st.session_state['stage6_errors']:
     st.error('State data errors: '+ '; '.join(f'{state_names[k]}: {v}' for k,v in st.session_state['stage6_errors'].items()))
 priority=[x for x in ('screening_status','distance_ft','nearby_facility','facility_category','matched_dma','applied_distance_ft','Unit #','Location Description','screening_notes') if x in res]
