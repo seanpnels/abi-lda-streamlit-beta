@@ -6,6 +6,7 @@ from pathlib import Path
 from collections import Counter
 from datetime import datetime, timezone
 import folium
+from folium.plugins import MarkerCluster
 from branca.element import MacroElement, Template
 import pandas as pd
 import requests
@@ -13,7 +14,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 from openpyxl.styles import PatternFill, Font
 from shapely.geometry import Point, box, shape
-from shapely.ops import transform
+from shapely.ops import transform, unary_union
+from shapely.prepared import prep
 from shapely.strtree import STRtree
 from pyproj import CRS, Transformer
 
@@ -540,19 +542,75 @@ def triggering_facility(near, status):
     return near[0]
 
 
+def placement_pin_title(row, number):
+    fields = {re.sub(r'[^a-z0-9]', '', str(key).lower()): value for key, value in row.items()}
+    for key in ('unit', 'unitnumber', 'unitno', 'unitid', 'mediapackagename',
+                'medianame', 'packagename', 'mediapackage', 'package', 'media'):
+        value = fields.get(key)
+        if pd.notna(value) and str(value).strip():
+            return str(value).strip()
+    return f'Placement {number}'
+
+
+def dma_osm_pin_records(map_rows):
+    area = unary_union(list(dma_geoms.values()))
+    within_dma = prep(area)
+    seen = set()
+    for _, _, row in map_rows[:1000]:
+        if status_code(row['screening_status']) not in ('RED', 'YELLOW'):
+            continue
+        lat, lon = row.get('facility_latitude'), row.get('facility_longitude')
+        if pd.notna(lat) and pd.notna(lon):
+            seen.add((round(float(lat), 7), round(float(lon), 7)))
+    records = []
+    unavailable = []
+    for slug, state in state_geoms.items():
+        if not within_dma.intersects(state):
+            continue
+        release = latest_asset(rels, f'stage6-osm-{slug}-', 'facilities.geojsonseq.gz')
+        if not release:
+            unavailable.append(state_names[slug])
+            continue
+        try:
+            # Use the full DMA envelope so generalized state edges don't clip pins.
+            facilities, _, manifest = load_filtered_state(
+                REPO, release['file_id'], release['manifest_id'], TOKEN, area.bounds)
+            generated = datetime.fromisoformat(str(manifest['generated_utc']).replace('Z', '+00:00'))
+            if (datetime.now(timezone.utc) - generated).total_seconds() > 10 * 86400:
+                raise ValueError('Stale snapshot')
+        except Exception:
+            unavailable.append(state_names[slug])
+            continue
+        for site in facilities:
+            lat, lon = facility_pin_location(site['geom'])
+            if lat is None or not within_dma.covers(Point(lon, lat)):
+                continue
+            position = (round(lat, 7), round(lon, 7))
+            if position in seen:
+                continue
+            seen.add(position)
+            title = site['name'].strip() or 'Unnamed OSM site'
+            popup = (f'<b>{html.escape(title)}</b><br>'
+                     + html.escape(', '.join(site['cats']))
+                     + '<br>OSM: ' + html.escape(site['osm_id']))
+            records.append({'position': {'lat': lat, 'lng': lon}, 'title': title, 'popup': popup})
+    return records, unavailable
+
+
 def google_review_map_records(rows):
     """Render one Google map; markers and ruler operate within its browser iframe."""
     records=[]
     colors={'RED':'#d93025','YELLOW':'#f9ab00','GREEN':'#188038','GRAY':'#80868b'}
     for number,(lat,lon,row) in enumerate(rows[:1000],start=1):
         flag=status_code(row['screening_status']);status=display_status(row['screening_status'])
-        popup=(f'<b>Placement {number}</b><br>'+html.escape(status)
+        title=placement_pin_title(row,number)
+        popup=(f'<b>{html.escape(title)}</b><br>'+html.escape(status)
                +'<br>Distance: '+html.escape(str(row['distance_ft']))+' ft'
                +'<br>Facility: '+html.escape(str(row['nearby_facility'])[:150])
                +'<br>DMA: '+html.escape(str(row.get('matched_dma','')))
                +'<br>Applied distance: '+html.escape(str(row.get('applied_distance_ft','')))+' ft')
         record={'position':{'lat':float(lat),'lng':float(lon)},'color':colors.get(flag,colors['GRAY']),
-                'title':f'Placement {number}: {status}','popup':popup,'facility':None}
+                'title':f'{title}: {status}','popup':popup,'facility':None}
         facility_lat=row.get('facility_latitude');facility_lon=row.get('facility_longitude')
         if flag in ('RED','YELLOW') and pd.notna(facility_lat) and pd.notna(facility_lon):
             name=str(row['nearby_facility']).strip() or 'Unnamed mapped facility'
@@ -579,7 +637,7 @@ html,body{margin:0;padding:0;height:100%;font:13px Arial,sans-serif;color:#17212
 </style></head><body>
 <div id="map"></div><div id="message" role="alert"></div>
 <script>
-let records=[];
+let records=[],osmSites=[];
 let componentStarted=false;
 function showError(text){const box=document.getElementById('message');box.textContent=text;box.style.display='block';}
 window.gm_authFailure=function(){showError('Google Maps rejected the key. Check Maps JavaScript API, billing and the allowed website. Keep website restrictions enabled.');};
@@ -643,6 +701,24 @@ window.initReviewMap=function(){
    marker.addListener('click',()=>{if(measuring)measurePoint(marker.getPosition());else{info.setContent(popup);info.open({map,anchor:marker});}});
    marker.addListener('mousemove',e=>{if(measuring&&start&&!finished&&e.latLng)preview(e.latLng);});
   }
+  const facilityPinPath='M 0,0 C -3,-5 -10,-12 -10,-18 A 10,10 0 1,1 10,-18 C 10,-12 3,-5 0,0 Z';
+  const visibleSites=new Map();
+  function updateOsmSites(){
+   const viewport=map.getBounds();
+   const zoom=map.getZoom();
+   osmSites.forEach((site,index)=>{
+    const visible=viewport && zoom>=12 && viewport.contains(site.position);
+    const existing=visibleSites.get(index);
+    if(!visible && existing){
+     existing.setMap(null);google.maps.event.clearInstanceListeners(existing);visibleSites.delete(index);
+    }else if(visible && !existing){
+     const marker=new google.maps.Marker({position:site.position,map,title:site.title,zIndex:1,
+      icon:{path:facilityPinPath,fillColor:'#111',fillOpacity:1,strokeColor:'#fff',strokeWeight:1,scale:1}});
+     visibleSites.set(index,marker);attach(marker,site.popup);
+    }
+   });
+  }
+  if(osmSites.length)map.addListener('idle',updateOsmSites);
   records.forEach(record=>{
    bounds.extend(record.position);
    const marker=new google.maps.Marker({position:record.position,map,title:record.title,zIndex:10,
@@ -651,7 +727,7 @@ window.initReviewMap=function(){
    if(record.facility){
     const facility=record.facility;
     const pin=new google.maps.Marker({position:facility.position,map,title:facility.title,zIndex:20,
-     icon:{path:'M 0,0 C -3,-5 -10,-12 -10,-18 A 10,10 0 1,1 10,-18 C 10,-12 3,-5 0,0 Z',
+     icon:{path:facilityPinPath,
       fillColor:record.color,fillOpacity:1,strokeColor:'#fff',strokeWeight:1,scale:1}});
     facilities.push(pin);attach(pin,facility.popup);bounds.extend(facility.position);
    }
@@ -672,7 +748,7 @@ window.addEventListener('message',function(event) {
  const args=event.data.args||{};
  if(!Array.isArray(args.records)||!args.records.length)return;
  if(!args.api_key){showError('Google Maps key missing.');return;}
- componentStarted=true;records=args.records;
+ componentStarted=true;records=args.records;osmSites=args.osm_sites||[];
  const loader=document.createElement('script');
  loader.src='https://maps.googleapis.com/maps/api/js?'+new URLSearchParams({key:args.api_key,v:'quarterly',loading:'async',libraries:'geometry',callback:'initReviewMap'}).toString();
  loader.async=true;loader.onerror=()=>showError('Google Maps could not load. Check your connection or browser content blocker.');document.head.appendChild(loader);
@@ -967,11 +1043,21 @@ st.caption('Circles mark placements. Pin-shaped markers identify the primary fac
 map_rows=[(lat,lon,r) for (lat,lon,_,_),(_,r) in zip(points,res.iterrows()) if lat is not None]
 if map_rows:
     google_key=st.secrets.get('GOOGLE_MAPS_API_KEY','').strip()
+    osm_sites=[]
+    if st.checkbox('Show OSM site pins',key='stage6_show_osm_sites'):
+        with st.spinner('Loading OSM sites across the selected markets…'):
+            osm_sites,unavailable=dma_osm_pin_records(map_rows)
+        if unavailable:
+            st.warning('OSM site pins unavailable for: '+', '.join(unavailable))
+        if google_key and osm_sites:
+            st.caption('Zoom in to see the black OSM site pins. Colored pins identify flagged sites.')
+        if not osm_sites and not unavailable:
+            st.caption('No additional OSM sites found in the selected markets.')
     if google_key:
         st.caption('Google Maps business labels appear as you zoom in. Ruler and pin controls run within the map.')
         map_records=google_review_map_records(map_rows)
-        map_identity=hashlib.sha256((json.dumps(map_records,allow_nan=False)+google_key).encode()).hexdigest()[:20]
-        google_review_component()(records=map_records,api_key=google_key,
+        map_identity=hashlib.sha256((json.dumps([map_records,osm_sites],allow_nan=False)+google_key).encode()).hexdigest()[:20]
+        google_review_component()(records=map_records,osm_sites=osm_sites,api_key=google_key,
                                   key='google_review_'+map_identity,default=None)
     else:
         st.info('Add GOOGLE_MAPS_API_KEY in Streamlit Secrets to use Google Maps. Showing the existing CARTO map meanwhile.')
@@ -990,9 +1076,16 @@ if map_rows:
         colors={'RED':'red','YELLOW':'orange','GREEN':'green','GRAY':'gray'}
         placement_layer=folium.FeatureGroup(name='Placements').add_to(m)
         facility_layer=folium.FeatureGroup(name='Flagged facilities').add_to(m)
+        if osm_sites:
+            osm_layer=MarkerCluster(name='OSM sites').add_to(m)
+            for site in osm_sites:
+                position=site['position']
+                folium.Marker([position['lat'],position['lng']],
+                              icon=folium.Icon(color='black',icon='exclamation-sign',prefix='glyphicon'),
+                              popup=folium.Popup(site['popup'],max_width=350)).add_to(osm_layer)
         for row_number,(lat,lon,r) in enumerate(map_rows[:1000],start=1):
             flag=status_code(r['screening_status']);status=display_status(r['screening_status']);color=colors.get(flag,'gray')
-            popup=f'<b>Placement {row_number}</b><br>'+html.escape(status)+'<br>Distance: '+html.escape(str(r['distance_ft']))+' ft<br>Facility: '+html.escape(str(r['nearby_facility'])[:150])
+            popup=f'<b>{html.escape(placement_pin_title(r,row_number))}</b><br>'+html.escape(status)+'<br>Distance: '+html.escape(str(r['distance_ft']))+' ft<br>Facility: '+html.escape(str(r['nearby_facility'])[:150])
             folium.CircleMarker([lat,lon],radius=6,color=color,fill=True,fill_opacity=.85,popup=folium.Popup(popup,max_width=350)).add_to(placement_layer)
             facility_lat=r.get('facility_latitude');facility_lon=r.get('facility_longitude')
             if flag in ('RED','YELLOW') and pd.notna(facility_lat) and pd.notna(facility_lon):
