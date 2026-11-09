@@ -587,6 +587,11 @@ window.initReviewMap=function(){
  try {
   const map=new google.maps.Map(document.getElementById('map'),{
    center:records[0].position,zoom:10,mapTypeId:'roadmap',streetViewControl:false,fullscreenControl:true,
+   mapTypeControl:true,mapTypeControlOptions:{
+    mapTypeIds:['roadmap','satellite'],
+    style:google.maps.MapTypeControlStyle.HORIZONTAL_BAR,
+    position:google.maps.ControlPosition.TOP_LEFT
+   },
    clickableIcons:true,gestureHandling:'greedy',styles:[{featureType:'poi.business',stylers:[{visibility:'on'}]}]
   });
   const bounds=new google.maps.LatLngBounds();
@@ -976,6 +981,11 @@ if map_rows:
         if '{api_key}' in url:url=url.replace('{api_key}',key) if key else ''
         if url:folium.TileLayer(tiles=url,attr='CARTO / OpenStreetMap contributors',name='CARTO dark').add_to(m)
         else:folium.TileLayer('CartoDB dark_matter',name='CARTO dark (public tiles)').add_to(m)
+        folium.TileLayer(
+            tiles='https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri, Vantor, Earthstar Geographics, and the GIS User Community',
+            name='Satellite', show=False, max_native_zoom=19,
+        ).add_to(m)
         LiveRuler().add_to(m)
         colors={'RED':'red','YELLOW':'orange','GREEN':'green','GRAY':'gray'}
         placement_layer=folium.FeatureGroup(name='Placements').add_to(m)
