@@ -477,6 +477,19 @@ def classify(t):
     if t.get('amenity') in AMENITIES:cats.add(AMENITIES[t['amenity']])
     if t.get('building') in BUILDINGS:cats.add(BUILDINGS[t['building']])
     if t.get('social_facility') in ('drug_addiction','alcohol_addiction'):cats.add('substance_use_candidate')
+    name = str(t.get('name') or '')
+    school_name = re.search(
+        r'\b(?:elementary|primary|middle|junior high|senior high|high|secondary|grade) school\b'
+        r'|\b(?:preschool|kindergarten|day[ -]?care|child[ -]?care|college prep(?:aratory)?)\b',
+        name, re.I)
+    if school_name and cats & {'school', 'university'}:
+        cats.discard('university')
+        cats.add('school')
+    elif 'daycare' not in cats and (
+        'university' in cats or ('school' in cats and re.search(r'\b(?:college|university)\b', name, re.I))
+    ):
+        cats.discard('school')
+        cats.add('university')
     return sorted(cats)
 
 def local_projection(lon,lat):
@@ -533,13 +546,10 @@ def facility_pin_location(geometry):
     return float(point.y), float(point.x)
 
 
-def triggering_facility(near, status):
-    if not near:
-        return None
-    # A nearer unverified point must not replace the polygon that caused RED.
-    if status.startswith('RED'):
-        return next((item for item in near if item[1]['quality']=='polygon_unverified'),None)
-    return near[0]
+def facility_triggers_red(distance, facility, restriction_ft):
+    return (facility['quality'] == 'polygon_unverified'
+            and facility['cats'] != ['university']
+            and distance <= restriction_ft * .3048)
 
 
 def placement_pin_title(row, number):
@@ -550,6 +560,29 @@ def placement_pin_title(row, number):
         if pd.notna(value) and str(value).strip():
             return str(value).strip()
     return f'Placement {number}'
+
+
+def additional_college_pins(map_rows, facility_hits):
+    primary = {(str(row['osm_id']), float(row['facility_latitude']), float(row['facility_longitude']))
+               for _, _, row in map_rows[:1000]
+               if status_code(row['screening_status']) in ('RED', 'YELLOW')
+               and pd.notna(row['facility_latitude']) and pd.notna(row['facility_longitude'])}
+    records = []
+    for hit in facility_hits:
+        if hit['status'] != 'YELLOW' or hit['category'] != 'university':
+            continue
+        key = (str(hit['osm_id']), float(hit['latitude']), float(hit['longitude']))
+        if key in primary:
+            continue
+        primary.add(key)
+        osm_id, lat, lon = key
+        title = hit['name'].strip() or 'Unnamed OSM site'
+        records.append({
+            'position': {'lat': lat, 'lng': lon}, 'title': title,
+            'popup': f'<b>{html.escape(title)}</b><br>Possible college or university — verify.'
+                     f'<br>OSM: {html.escape(osm_id)}',
+        })
+    return records
 
 
 def dma_osm_pin_records(map_rows):
@@ -616,6 +649,7 @@ def google_review_map_records(rows):
             name=str(row['nearby_facility']).strip() or 'Unnamed mapped facility'
             record['facility']={'position':{'lat':float(facility_lat),'lng':float(facility_lon)},
                 'title':'Flagged facility: '+name,
+                'color':colors['YELLOW'] if row.get('facility_category') == 'university' else record['color'],
                 'popup':(f'<b>Flagged facility for placement {number}</b><br>'+html.escape(name)
                          +'<br>'+html.escape(str(row['facility_category']))
                          +'<br>OSM: '+html.escape(str(row['osm_id']))
@@ -637,7 +671,7 @@ html,body{margin:0;padding:0;height:100%;font:13px Arial,sans-serif;color:#17212
 </style></head><body>
 <div id="map"></div><div id="message" role="alert"></div>
 <script>
-let records=[],osmSites=[];
+let records=[],osmSites=[],collegePins=[];
 let componentStarted=false;
 function showError(text){const box=document.getElementById('message');box.textContent=text;box.style.display='block';}
 window.gm_authFailure=function(){showError('Google Maps rejected the key. Check Maps JavaScript API, billing and the allowed website. Keep website restrictions enabled.');};
@@ -657,7 +691,7 @@ window.initReviewMap=function(){
   const placements=[],facilities=[];
   let measuring=false,start=null,finished=false,line=null,label=null,endDot=null,startDot=null;
   const toolbar=document.createElement('div');toolbar.className='toolbar';
-  toolbar.innerHTML='<button id="ruler" type="button" aria-pressed="false">Ruler</button><button id="clear" type="button">Clear</button><div id="distance">Ruler off</div><div class="help">Click start → move mouse → click end. Esc exits ruler mode.</div><label><input id="placements" type="checkbox" checked> Placements</label><label><input id="facilities" type="checkbox" checked> Flagged facilities</label>';
+  toolbar.innerHTML='<button id="ruler" type="button" aria-pressed="false">Ruler</button><button id="clear" type="button">Clear</button><div id="distance">Ruler off</div><div class="help">Click start → move mouse → click end. Esc exits ruler mode.</div><label><input id="placements" type="checkbox" checked> Placements</label><label><input id="facilities" type="checkbox" checked> Flagged facilities</label><label><input id="osm-sites" type="checkbox"> Show OSM site pins</label>';
   map.controls[google.maps.ControlPosition.TOP_RIGHT].push(toolbar);
   ['click','dblclick','mousedown','touchstart'].forEach(type=>toolbar.addEventListener(type,e=>e.stopPropagation()));
   const readout=toolbar.querySelector('#distance'),rulerButton=toolbar.querySelector('#ruler');
@@ -703,11 +737,19 @@ window.initReviewMap=function(){
   }
   const facilityPinPath='M 0,0 C -3,-5 -10,-12 -10,-18 A 10,10 0 1,1 10,-18 C 10,-12 3,-5 0,0 Z';
   const visibleSites=new Map();
+  const osmToggle=toolbar.querySelector('#osm-sites');
+  osmToggle.disabled=!osmSites.length;
   function updateOsmSites(){
-   const viewport=map.getBounds();
-   const zoom=map.getZoom();
+   const viewport=osmToggle.checked && map.getZoom()>=12 ? map.getBounds() : null;
+   if(!viewport){
+    visibleSites.forEach(marker=>{
+     marker.setMap(null);google.maps.event.clearInstanceListeners(marker);
+    });
+    visibleSites.clear();
+    return;
+   }
    osmSites.forEach((site,index)=>{
-    const visible=viewport && zoom>=12 && viewport.contains(site.position);
+    const visible=viewport.contains(site.position);
     const existing=visibleSites.get(index);
     if(!visible && existing){
      existing.setMap(null);google.maps.event.clearInstanceListeners(existing);visibleSites.delete(index);
@@ -718,6 +760,7 @@ window.initReviewMap=function(){
     }
    });
   }
+  osmToggle.onchange=updateOsmSites;
   if(osmSites.length)map.addListener('idle',updateOsmSites);
   records.forEach(record=>{
    bounds.extend(record.position);
@@ -728,9 +771,14 @@ window.initReviewMap=function(){
     const facility=record.facility;
     const pin=new google.maps.Marker({position:facility.position,map,title:facility.title,zIndex:20,
      icon:{path:facilityPinPath,
-      fillColor:record.color,fillOpacity:1,strokeColor:'#fff',strokeWeight:1,scale:1}});
+      fillColor:facility.color,fillOpacity:1,strokeColor:'#fff',strokeWeight:1,scale:1}});
     facilities.push(pin);attach(pin,facility.popup);bounds.extend(facility.position);
    }
+  });
+  collegePins.forEach(site=>{
+   const pin=new google.maps.Marker({position:site.position,map,title:site.title,zIndex:19,
+    icon:{path:facilityPinPath,fillColor:'#f9ab00',fillOpacity:1,strokeColor:'#fff',strokeWeight:1,scale:1}});
+   facilities.push(pin);attach(pin,site.popup);
   });
   toolbar.querySelector('#placements').onchange=e=>placements.forEach(marker=>marker.setMap(e.target.checked?map:null));
   toolbar.querySelector('#facilities').onchange=e=>facilities.forEach(marker=>marker.setMap(e.target.checked?map:null));
@@ -748,7 +796,7 @@ window.addEventListener('message',function(event) {
  const args=event.data.args||{};
  if(!Array.isArray(args.records)||!args.records.length)return;
  if(!args.api_key){showError('Google Maps key missing.');return;}
- componentStarted=true;records=args.records;osmSites=args.osm_sites||[];
+ componentStarted=true;records=args.records;osmSites=args.osm_sites||[];collegePins=args.college_pins||[];
  const loader=document.createElement('script');
  loader.src='https://maps.googleapis.com/maps/api/js?'+new URLSearchParams({key:args.api_key,v:'quarterly',loading:'async',libraries:'geometry',callback:'initReviewMap'}).toString();
  loader.async=true;loader.onerror=()=>showError('Google Maps could not load. Check your connection or browser content blocker.');document.head.appendChild(loader);
@@ -897,7 +945,7 @@ try:
     st.caption(f'Placements: {len(df):,} · Required state datasets: {", ".join(state_names[s] for s in sorted(all_needed)) or "none"}')
     if missing:st.error('Missing state snapshots: '+', '.join(state_names[s] for s in missing)+'. Placements requiring these states will be marked Unable to Locate.')
 
-    fingerprint=(inventory_key,idx_id,tuple(sorted(dma_distances.items())),tuple(sorted((k,v['tag']) for k,v in available.items())))
+    fingerprint=('university-review-v1',inventory_key,idx_id,tuple(sorted(dma_distances.items())),tuple(sorted((k,v['tag']) for k,v in available.items())))
     if run_clicked:
         start=time.perf_counter(); datasets={};load_errors={}
         suggested_additions=Counter()
@@ -955,14 +1003,17 @@ try:
                     try:d=p.distance(transform(project,f['geom']))
                     except Exception:continue
                     if d<=radius_m:near.append((d,f))
-            near.sort(key=lambda item:item[0]);poly=[(d,f) for d,f in near if f['quality']=='polygon_unverified']
-            nonpoly=[(d,f) for d,f in near if f['quality']!='polygon_unverified']
-            if poly and poly[0][0]<=restriction*.3048:status='RED — Potential conflict'
-            elif poly or nonpoly:status='YELLOW — Review required'
+            near.sort(key=lambda item:item[0])
+            red_trigger=next((item for item in near if facility_triggers_red(*item, restriction)),None)
+            if red_trigger:status='RED — Potential conflict'
+            elif near:status='YELLOW — Review required'
             else:status='GREEN — No detected conflict'
+            trigger=red_trigger or (near[0] if near else None)
             rec['screening_status']=status
             rec['state_snapshots']='; '.join(f'{s}: {available[s]["tag"]}' for s in needs)
             rec['screening_notes']='OSM candidate screening only; human review required.'+(' '+rule['note'] if rule['note'] else '')
+            if any(f['cats'] == ['university'] for _,f in near):
+                rec['screening_notes']+=' Possible college or university — verify.'
             # Export every candidate within the review band, not only the primary
             # facility displayed in the placement row/pin popup.
             if status.startswith(('RED','YELLOW')):
@@ -970,14 +1021,12 @@ try:
                 for distance,facility in near:
                     facility_lat,facility_lon=facility_pin_location(facility['geom'])
                     if facility_lat is None or facility_lon is None:continue
-                    hit_status=('RED' if facility['quality']=='polygon_unverified'
-                                and distance<=restriction*.3048 else 'YELLOW')
+                    hit_status='RED' if facility_triggers_red(distance,facility,restriction) else 'YELLOW'
                     facility_hits.append({'name':facility['name'],'latitude':facility_lat,
                         'longitude':facility_lon,'status':hit_status,'category':'; '.join(facility['cats']),
                         'osm_id':facility['osm_id'],'distance_ft':round(distance/.3048,1),
                         'screening_row':screening_row,'applied_distance_ft':restriction,'source_file':str(source[inventory_meta['file']]),
                         'source_row':str(source[inventory_meta['row']])})
-            trigger=triggering_facility(near,status)
             if trigger:
                 d,f=trigger
                 facility_lat,facility_lon=facility_pin_location(f['geom'])
@@ -991,6 +1040,7 @@ try:
         st.session_state['stage6_elapsed']=time.perf_counter()-start
         st.session_state['stage6_errors']=load_errors
         st.session_state['stage6_facility_hits']=facility_hits
+        st.session_state.pop('stage6_map_osm_sites',None)
         st.session_state['stage6_suggested_additions']=suggested_additions
         progress.update(label='Screening complete',state='complete',expanded=False)
 except Exception as exc:
@@ -1039,25 +1089,34 @@ with a:st.download_button('Download color-coded Excel',excel_bytes(res,st.sessio
 with b:st.download_button('Download screening CSV',res_display.to_csv(index=False).encode('utf-8-sig'),'ABI_Stage6_screening.csv')
 st.caption('Excel includes a Flagged facilities worksheet with all detected Non-Compliant / Needs Review candidates and importable coordinates. In My Maps, use Latitude/Longitude for location and Business name for the title.')
 st.subheader('Review map')
-st.caption('Circles mark placements. Pin-shaped markers identify the primary facility behind each Non-Compliant / Needs Review flag. Facility pins use mapped OSM locations, not verified street addresses.')
+st.caption('Circles mark placements. Pin-shaped markers identify flagged facilities, including colleges and universities that need separate review. Facility pins use mapped OSM locations, not verified street addresses.')
 map_rows=[(lat,lon,r) for (lat,lon,_,_),(_,r) in zip(points,res.iterrows()) if lat is not None]
 if map_rows:
     google_key=st.secrets.get('GOOGLE_MAPS_API_KEY','').strip()
-    osm_sites=[]
-    if st.checkbox('Show OSM site pins',key='stage6_show_osm_sites'):
+    college_pins=additional_college_pins(map_rows,st.session_state.get('stage6_facility_hits',[]))
+    osm_cache_key=(fingerprint,tuple(rel.get('tag_name') for rel in rels))
+    cached_osm=st.session_state.get('stage6_map_osm_sites')
+    if cached_osm is None or cached_osm[0]!=osm_cache_key:
         with st.spinner('Loading OSM sites across the selected markets…'):
             osm_sites,unavailable=dma_osm_pin_records(map_rows)
-        if unavailable:
-            st.warning('OSM site pins unavailable for: '+', '.join(unavailable))
-        if google_key and osm_sites:
-            st.caption('Zoom in to see the black OSM site pins. Colored pins identify flagged sites.')
-        if not osm_sites and not unavailable:
-            st.caption('No additional OSM sites found in the selected markets.')
+        college_positions={(round(pin['position']['lat'],7),round(pin['position']['lng'],7))
+                           for pin in college_pins}
+        osm_sites=[site for site in osm_sites if
+                   (round(site['position']['lat'],7),round(site['position']['lng'],7)) not in college_positions]
+        st.session_state['stage6_map_osm_sites']=(osm_cache_key,osm_sites,unavailable)
+    else:
+        _,osm_sites,unavailable=cached_osm
+    if unavailable:
+        st.warning('OSM site pins unavailable for: '+', '.join(unavailable))
+    if google_key and osm_sites:
+        st.caption('Turn on Show OSM site pins in the map toolbar and zoom in to see the black pins.')
+    if not osm_sites and not unavailable:
+        st.caption('No additional OSM sites found in the selected markets.')
     if google_key:
         st.caption('Google Maps business labels appear as you zoom in. Ruler and pin controls run within the map.')
         map_records=google_review_map_records(map_rows)
-        map_identity=hashlib.sha256((json.dumps([map_records,osm_sites],allow_nan=False)+google_key).encode()).hexdigest()[:20]
-        google_review_component()(records=map_records,osm_sites=osm_sites,api_key=google_key,
+        map_identity=hashlib.sha256((json.dumps([map_records,osm_sites,college_pins],allow_nan=False)+google_key).encode()).hexdigest()[:20]
+        google_review_component()(records=map_records,osm_sites=osm_sites,college_pins=college_pins,api_key=google_key,
                                   key='google_review_'+map_identity,default=None)
     else:
         st.info('Add GOOGLE_MAPS_API_KEY in Streamlit Secrets to use Google Maps. Showing the existing CARTO map meanwhile.')
@@ -1077,7 +1136,8 @@ if map_rows:
         placement_layer=folium.FeatureGroup(name='Placements').add_to(m)
         facility_layer=folium.FeatureGroup(name='Flagged facilities').add_to(m)
         if osm_sites:
-            osm_layer=MarkerCluster(name='OSM sites').add_to(m)
+            osm_group=folium.FeatureGroup(name='Show OSM site pins',show=False).add_to(m)
+            osm_layer=MarkerCluster(control=False).add_to(osm_group)
             for site in osm_sites:
                 position=site['position']
                 folium.Marker([position['lat'],position['lng']],
@@ -1095,9 +1155,16 @@ if map_rows:
                     +'<br>OSM: '+html.escape(str(r['osm_id']))
                     +'<br>Pin marks mapped facility location; measure manually.')
                 folium.Marker([float(facility_lat),float(facility_lon)],
-                    icon=folium.Icon(color=color,icon='exclamation-sign',prefix='glyphicon'),
+                    icon=folium.Icon(color='orange' if r.get('facility_category') == 'university' else color,
+                                     icon='exclamation-sign',prefix='glyphicon'),
                     tooltip='Flagged facility: '+html.escape(name),
                     popup=folium.Popup(facility_popup,max_width=350)).add_to(facility_layer)
+        for site in college_pins:
+            position=site['position']
+            folium.Marker([position['lat'],position['lng']],
+                          icon=folium.Icon(color='orange',icon='exclamation-sign',prefix='glyphicon'),
+                          tooltip=html.escape(site['title']),
+                          popup=folium.Popup(site['popup'],max_width=350)).add_to(facility_layer)
         folium.LayerControl(collapsed=False).add_to(m)
         # Explicit heights on both Leaflet and its iframe prevent a collapsed map.
         # Pan, zoom, popups and measuring stay in the browser without app reruns.
