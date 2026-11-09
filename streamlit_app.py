@@ -162,8 +162,7 @@ def osm_refresh_label(all_releases, now):
     else:
         amount, unit = (hours, 'hour') if hours < 24 else (hours // 24, 'day')
         age = f'{amount} {unit}{"s" if amount != 1 else ""} ago'
-    coverage = f' ({len(current)} of 51 published)' if len(current) != 51 else ''
-    return f'Oldest state snapshot published {age}{coverage}'
+    return f'Oldest state snapshot published {age}'
 
 
 def latest_index(all_releases):
