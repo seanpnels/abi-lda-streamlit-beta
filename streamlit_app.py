@@ -99,7 +99,8 @@ def display_status(value):
 st.set_page_config(page_title='ABI OOH - LDA Screening Tool',page_icon='🗺️',layout='wide')
 st.title('ABI OOH - LDA Screening Tool')
 st.caption('209 DMA Source: Esri')
-st.caption('Non-Compliant Location Source: OpenStreetMap (OSM)')
+osm_source = st.empty()
+osm_source.caption('Non-Compliant Location Source: OpenStreetMap (OSM)')
 st.markdown('**Instructions:**\n\n1. Upload the MediaX Responses grid\n2. Check DMAs; add any missing\n3. Run Nationwide Screening\n4. Enjoy!')
 st.warning('**Every placement requires human review.** OSM coverage is incomplete; candidate polygons are not verified building footprints. Results are preliminary screening outcomes, not final clearance.')
 try:
@@ -135,6 +136,35 @@ def latest_asset(all_releases,prefix,filename):
         if filename in assets and 'manifest.json' in assets:
             return {'tag':rel['tag_name'],'file_id':assets[filename],'manifest_id':assets['manifest.json']}
     return None
+
+def osm_refresh_label(all_releases, now):
+    """Report the oldest GitHub publication among the snapshots the app would select."""
+    current = {}
+    for release in all_releases:
+        match = re.fullmatch(r'stage6-osm-([a-z-]+)-[0-9]+', release.get('tag_name', ''))
+        if not match or release.get('draft') or release.get('prerelease'):
+            continue
+        state = match[1]
+        if state in current:
+            continue
+        assets = {asset['name'] for asset in release.get('assets', [])}
+        if {'facilities.geojsonseq.gz', 'manifest.json'} <= assets:
+            current[state] = release.get('published_at')
+    if not current or not all(current.values()):
+        return 'Refresh age unavailable'
+    try:
+        oldest = min(datetime.fromisoformat(value.replace('Z', '+00:00')) for value in current.values())
+        hours = max(0, int((now - oldest).total_seconds() // 3600))
+    except (TypeError, ValueError):
+        return 'Refresh age unavailable'
+    if hours < 1:
+        age = 'less than an hour ago'
+    else:
+        amount, unit = (hours, 'hour') if hours < 24 else (hours // 24, 'day')
+        age = f'{amount} {unit}{"s" if amount != 1 else ""} ago'
+    coverage = f' ({len(current)} of 51 published)' if len(current) != 51 else ''
+    return f'Oldest state snapshot published {age}{coverage}'
+
 
 def latest_index(all_releases):
     for rel in all_releases:
@@ -243,21 +273,24 @@ def reset_control():
     st.button('Reset / Start Over',key='stage6_reset_button',on_click=reset_campaign)
 
 
+def show_osm_refresh():
+    try:
+        all_releases = releases(REPO, TOKEN)
+        label = osm_refresh_label(all_releases, datetime.now(timezone.utc))
+    except requests.RequestException:
+        all_releases = None
+        label = 'Refresh age unavailable'
+    osm_source.caption(f'Non-Compliant Location Source: OpenStreetMap (OSM) · {label}')
+    return all_releases
+
+
 # Upload first; all grids are combined without dropping repeated placements.
 files=st.file_uploader('1. Upload placement grids (CSV or XLSX)',type=['csv','xlsx'],accept_multiple_files=True,key='stage6_files_'+str(st.session_state.get('stage6_upload_epoch',0)))
 if not files:
-    st.info('Upload one or more grids to begin.');st.stop()
-try:
-    df,inventory_meta,grid_summaries=read_inventory_grids(files)
-    lat_col=inventory_meta['lat'];lon_col=inventory_meta['lon']
-except Exception as exc:st.error(f'Inventory error: {exc}');st.stop()
-grid_digest=hashlib.sha256()
-for upload in files:
-    grid_digest.update(upload.name.encode('utf-8'));grid_digest.update(hashlib.sha256(upload.getvalue()).digest())
-inventory_key=grid_digest.hexdigest()
-st.caption(f'{len(files)} grid(s) loaded: {len(df):,} placements total. Source filenames are included in exports.')
-with st.expander('Uploaded grids'):
-    st.dataframe(pd.DataFrame(grid_summaries),hide_index=True)
+    st.info('Upload one or more grids to begin.')
+    show_osm_refresh()
+    st.stop()
+
 
 @st.cache_resource(show_spinner=False, max_entries=1)
 def geographic_index(repo,asset_id,token):
@@ -274,15 +307,33 @@ def selected_dma_geometry(repo,asset_id,token,code):
     features,_,_=geographic_index(repo,asset_id,token)
     return shape(features[code]['geometry'])
 
-try:
-    rels=releases(REPO,TOKEN)
-    idx_id=latest_index(rels)
-    if idx_id is None:
-        st.error('Stage 6 DMA index not published yet.');st.stop()
-    dma_features,state_geoms,state_names=geographic_index(REPO,idx_id,TOKEN)
-except Exception as exc:st.error(f'Cannot load Stage 6 geographic index: {exc}');st.stop()
-dma_names={code:f['properties']['name'] for code,f in dma_features.items()}
-labels={f'{dma_names[k]} ({k})':k for k in sorted(dma_names,key=lambda k:dma_names[k])}
+with st.spinner('Reading your grids and detecting markets…'):
+    rels = show_osm_refresh()
+    try:
+        df,inventory_meta,grid_summaries=read_inventory_grids(files)
+        lat_col=inventory_meta['lat'];lon_col=inventory_meta['lon']
+    except Exception as exc:
+        st.error(f'Inventory error: {exc}');st.stop()
+    grid_digest=hashlib.sha256()
+    for upload in files:
+        grid_digest.update(upload.name.encode('utf-8'));grid_digest.update(hashlib.sha256(upload.getvalue()).digest())
+    inventory_key=grid_digest.hexdigest()
+    try:
+        if rels is None:
+            st.error('Cannot load Stage 6 releases from GitHub.');st.stop()
+        idx_id=latest_index(rels)
+        if idx_id is None:
+            st.error('Stage 6 DMA index not published yet.');st.stop()
+        dma_features,state_geoms,state_names=geographic_index(REPO,idx_id,TOKEN)
+    except Exception as exc:
+        st.error(f'Cannot load Stage 6 geographic index: {exc}');st.stop()
+    dma_names={code:f['properties']['name'] for code,f in dma_features.items()}
+    labels={f'{dma_names[k]} ({k})':k for k in sorted(dma_names,key=lambda k:dma_names[k])}
+    suggested_codes,market_review=suggest_market_dmas(df[inventory_meta['market']],dma_names)
+
+st.caption(f'{len(files)} grid(s) loaded: {len(df):,} placements total. Source filenames are included in exports.')
+with st.expander('Uploaded grids'):
+    st.dataframe(pd.DataFrame(grid_summaries),hide_index=True)
 
 MARKET_PICKER_HTML=r'''<!doctype html><html><head><meta charset="utf-8"><style>
 *{box-sizing:border-box}html,body{margin:0;background:transparent;font:14px Arial,sans-serif;color:var(--text,#eef3f8)}
@@ -298,9 +349,9 @@ MARKET_PICKER_HTML=r'''<!doctype html><html><head><meta charset="utf-8"><style>
 #search:focus{border-color:#2dd4a6}#results{margin-top:4px;max-height:165px;overflow:auto;background:#101b29;border:1px solid #334155;border-radius:7px}
 .option{display:block;width:100%;background:transparent;color:#eef3f8;border:0;text-align:left;padding:10px;font:inherit;cursor:pointer}
 .option:hover,.option:focus{background:#20364b}#empty{color:#aebdcd;font-size:13px;padding:12px 0}
-.footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:15px}.footer span{font-size:12px;color:#aebdcd}
+.footer{display:flex;flex-direction:column;align-items:flex-start;gap:12px;margin-top:15px}.footer span{font-size:12px;color:#aebdcd}
 #apply{background:#20bda9;color:#052820;border:0;border-radius:7px;padding:10px 16px;font:600 13px Arial,sans-serif;cursor:pointer}#apply:disabled{opacity:.45;cursor:default}
-@media(max-width:520px){.panel{padding:14px}.market-row{gap:6px}.market-name{font-size:12px}.distance-group button{padding:7px 8px;min-width:48px}.footer{align-items:flex-start;flex-direction:column}}
+@media(max-width:520px){.panel{padding:14px}.market-row{gap:6px}.market-name{font-size:12px}.distance-group button{padding:7px 8px;min-width:48px}}
 </style></head><body><div class="panel" id="panel"><div class="heading">Campaign markets &amp; distances</div><div class="sub">Confirm your detected markets. Use 500′ by default or select a 250′ exception.</div><div id="selected"></div><button id="add" type="button">+ Add market</button><div id="searchbox" hidden><input id="search" type="search" aria-label="Search markets" placeholder="Type a market name…" autocomplete="off"><div id="results" role="listbox" aria-label="Available markets"></div></div><div class="footer"><span id="summary"></span><button id="apply" type="button">Apply campaign settings</button></div></div>
 <script>
 let options=[],rules={},initialized=false,lastHeight=0;
@@ -355,7 +406,6 @@ def placement_dma_rule(lon,lat,chosen,geometries,distances,names):
             'note':'Multiple DMA boundaries matched; larger distance applied.' if len(matches)>1 else ''}
 
 
-suggested_codes,market_review=suggest_market_dmas(df[inventory_meta['market']],dma_names)
 suggested_labels=[label for label,code in labels.items() if code in suggested_codes]
 settings_context=(inventory_key,idx_id,st.session_state.get('stage6_upload_epoch',0))
 if st.session_state.get('stage6_inventory_context')!=settings_context:
