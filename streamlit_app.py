@@ -50,16 +50,20 @@ class LiveRuler(MacroElement):
             var clear=L.DomUtil.create('button','',box);clear.textContent='Clear';clear.type='button';clear.style.cursor='pointer';
             readout=L.DomUtil.create('div','',box);readout.style.marginTop='7px';readout.textContent='Ruler off';
             var help=L.DomUtil.create('div','',box);help.style.cssText='margin-top:5px;max-width:240px;font-size:11px;color:#444;';
-            help.textContent='Click start → move mouse → click end. Esc clears.';
+            help.textContent='Click start → move mouse → click end. Esc exits ruler mode.';
             L.DomEvent.disableClickPropagation(box);L.DomEvent.disableScrollPropagation(box);
-            button.onclick=function() {
-                active=!active;button.textContent=active?'Ruler: ON':'Ruler';button.setAttribute('aria-pressed',String(active));
-                map.getContainer().style.cursor=active?'crosshair':'';clearMeasure();
-            };
+            button.onclick=function() { setRulerActive(!active); };
             clear.onclick=clearMeasure;
             return box;
         };
         control.addTo(map);
+        function setRulerActive(enabled) {
+            active=enabled;
+            button.textContent=active?'Ruler: ON':'Ruler';
+            button.setAttribute('aria-pressed',String(active));
+            map.getContainer().style.cursor=active?'crosshair':'';
+            clearMeasure();
+        }
         map.on('click',function(e) {
             if(!active)return;
             if(!start || finished) {
@@ -74,7 +78,7 @@ class LiveRuler(MacroElement):
         map.on('mousemove',function(e) { if(active && start && !finished)update(e.latlng); });
         var container=map.getContainer();
         if(!container.hasAttribute('tabindex'))container.setAttribute('tabindex','0');
-        container.addEventListener('keydown',function(e) { if(e.key==='Escape')clearMeasure(); });
+        container.ownerDocument.addEventListener('keydown',function(e) { if(e.key==='Escape'&&active)setRulerActive(false); },true);
     })({{this._parent.get_name()}});
     {% endmacro %}
     """)
@@ -577,7 +581,7 @@ window.initReviewMap=function(){
   const placements=[],facilities=[];
   let measuring=false,start=null,finished=false,line=null,label=null,endDot=null,startDot=null;
   const toolbar=document.createElement('div');toolbar.className='toolbar';
-  toolbar.innerHTML='<button id="ruler" type="button" aria-pressed="false">Ruler</button><button id="clear" type="button">Clear</button><div id="distance">Ruler off</div><div class="help">Click start → move mouse → click end. Esc clears.</div><label><input id="placements" type="checkbox" checked> Placements</label><label><input id="facilities" type="checkbox" checked> Flagged facilities</label>';
+  toolbar.innerHTML='<button id="ruler" type="button" aria-pressed="false">Ruler</button><button id="clear" type="button">Clear</button><div id="distance">Ruler off</div><div class="help">Click start → move mouse → click end. Esc exits ruler mode.</div><label><input id="placements" type="checkbox" checked> Placements</label><label><input id="facilities" type="checkbox" checked> Flagged facilities</label>';
   map.controls[google.maps.ControlPosition.TOP_RIGHT].push(toolbar);
   ['click','dblclick','mousedown','touchstart'].forEach(type=>toolbar.addEventListener(type,e=>e.stopPropagation()));
   const readout=toolbar.querySelector('#distance'),rulerButton=toolbar.querySelector('#ruler');
@@ -607,13 +611,14 @@ window.initReviewMap=function(){
    if(!start||finished){clearMeasure();start=point;startDot=dot(point);readout.textContent='Move mouse to measure; click to finish.';}
    else{preview(point);endDot=dot(point);finished=true;}
   }
-  rulerButton.onclick=function(){
-   measuring=!measuring;info.close();clearMeasure();
+  function setRulerActive(enabled){
+   measuring=enabled;info.close();clearMeasure();
    rulerButton.textContent=measuring?'Ruler: ON':'Ruler';rulerButton.setAttribute('aria-pressed',String(measuring));
    map.setOptions({draggableCursor:measuring?'crosshair':null});
-  };
+  }
+  rulerButton.onclick=()=>setRulerActive(!measuring);
   toolbar.querySelector('#clear').onclick=clearMeasure;
-  document.addEventListener('keydown',e=>{if(e.key==='Escape')clearMeasure();});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&measuring)setRulerActive(false);},true);
   map.addListener('click',e=>{if(measuring){if(e.stop)e.stop();measurePoint(e.latLng);}});
   map.addListener('mousemove',e=>{if(measuring&&start&&!finished&&e.latLng)preview(e.latLng);});
   function attach(marker,popup){
