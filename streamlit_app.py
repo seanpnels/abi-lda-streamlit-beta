@@ -401,9 +401,21 @@ def market_picker_component():
     return components.declare_component('lda_campaign_panel_v2',path=str(directory))
 
 
+@st.cache_resource(show_spinner=False, max_entries=1)
+def nationwide_dma_lookup(repo, asset_id, token):
+    features, _, _ = geographic_index(repo, asset_id, token)
+    codes = tuple(features)
+    geometries = [shape(features[code]['geometry']) for code in codes]
+    return codes, STRtree(geometries)
+
+
+class OutsideSelectedDMA(ValueError):
+    pass
+
+
 def placement_dma_rule(lon,lat,chosen,geometries,distances,names):
     matches=[code for code in chosen if geometries[code].covers(Point(lon,lat))]
-    if not matches:raise ValueError('Outside selected DMA boundary')
+    if not matches:raise OutsideSelectedDMA('Outside selected DMA boundary')
     return {'dma':'; '.join(names[code] for code in matches),
             'distance':max(distances[code] for code in matches),
             'note':'Multiple DMA boundaries matched; larger distance applied.' if len(matches)>1 else ''}
@@ -433,7 +445,8 @@ initial_rules={labels[label]:st.session_state['stage6_dma_distances'].get(labels
 panel_value=market_picker_component()(
     options=[{'value':code,'label':dma_names[code]} for code in labels.values()],
     initial_rules=initial_rules,
-    key='campaign_panel_v2_'+hashlib.sha256(str(settings_context).encode()).hexdigest()[:16],default=None)
+    key='campaign_panel_v2_'+hashlib.sha256(str(settings_context).encode()).hexdigest()[:16]
+        +'_'+str(st.session_state.get('stage6_panel_revision',0)),default=None)
 if panel_value is not None:
     try:
         proposed=panel_value['distances']
@@ -758,11 +771,26 @@ def excel_bytes(result, facility_hits=None):
         for column,width in widths.items():ws.column_dimensions[column].width=width
     return out.getvalue()
 
+def add_suggested_markets_and_rerun(codes):
+    distances = {**st.session_state['stage6_settings']['distances']}
+    for code in codes:
+        distances.setdefault(code, 500)
+    selection = [label for label, code in labels.items() if code in distances]
+    st.session_state['stage6_dma_selection'] = selection
+    st.session_state['stage6_dma_distances'].update(distances)
+    st.session_state['stage6_settings'] = {'labels': selection, 'distances': distances}
+    # Remount the picker so its browser state reflects the updated selection.
+    st.session_state['stage6_panel_revision'] = st.session_state.get('stage6_panel_revision', 0) + 1
+    st.session_state['stage6_rerun_requested'] = True
+
+
 run_clicked=st.button('Run Nationwide Screening',type='primary')
+run_clicked=st.session_state.pop('stage6_rerun_requested',False) or run_clicked
 progress=st.status('Screening in progress… Checking placement coordinates',state='running',expanded=True) if run_clicked else None
 try:
     chosen=[labels[x] for x in selected_labels]
     points=[]; point_rules=[];all_needed=set();valid=[]
+    outside_points=[]
     for _,r in df.iterrows():
         rule=None
         try:
@@ -772,6 +800,10 @@ try:
             needs=needed_states(lon,lat)
             if not needs:raise ValueError('No matching state geometry / unsupported territory')
             points.append((lat,lon,needs,''));all_needed.update(needs);valid.append((lat,lon))
+        except OutsideSelectedDMA as exc:
+            points.append((None,None,[],str(exc)))
+            if run_clicked:
+                outside_points.append(Point(lon,lat))
         except Exception as exc:points.append((None,None,[],str(exc)))
         point_rules.append(rule)
 
@@ -784,9 +816,16 @@ try:
     st.caption(f'Placements: {len(df):,} · Required state datasets: {", ".join(state_names[s] for s in sorted(all_needed)) or "none"}')
     if missing:st.error('Missing state snapshots: '+', '.join(state_names[s] for s in missing)+'. Placements requiring these states will be marked Unable to Locate.')
 
-    fingerprint=(inventory_key,tuple(sorted(dma_distances.items())),tuple(sorted((k,v['tag']) for k,v in available.items())))
+    fingerprint=(inventory_key,idx_id,tuple(sorted(dma_distances.items())),tuple(sorted((k,v['tag']) for k,v in available.items())))
     if run_clicked:
         start=time.perf_counter(); datasets={};load_errors={}
+        suggested_additions=Counter()
+        if outside_points:
+            progress.update(label='Looking up markets for out-of-market placements…',state='running')
+            lookup_codes,dma_tree=nationwide_dma_lookup(REPO,idx_id,TOKEN)
+            _,matches=dma_tree.query(outside_points,predicate='covered_by')
+            suggested_additions.update(lookup_codes[int(i)] for i in matches
+                                       if lookup_codes[int(i)] not in dma_distances)
         # Bound the indexed area to actual inventory plus a conservative ~2km envelope.
         if valid:
             bounds=(min(p[1] for p in valid)-.04,min(p[0] for p in valid)-.04,
@@ -871,6 +910,7 @@ try:
         st.session_state['stage6_elapsed']=time.perf_counter()-start
         st.session_state['stage6_errors']=load_errors
         st.session_state['stage6_facility_hits']=facility_hits
+        st.session_state['stage6_suggested_additions']=suggested_additions
         progress.update(label='Screening complete',state='complete',expanded=False)
 except Exception as exc:
     if progress:progress.update(label='Screening stopped — please review the error below',state='error',expanded=True)
@@ -880,6 +920,17 @@ if st.session_state.get('stage6_fingerprint')!=fingerprint:
     st.info('Run screening to generate results.');reset_control();st.stop()
 res=st.session_state['stage6_result'];counts=Counter(str(x).split(' — ')[0] for x in res['screening_status'])
 st.markdown(result_summary_html(counts),unsafe_allow_html=True)
+suggested_additions=st.session_state.get('stage6_suggested_additions',{})
+if suggested_additions:
+    st.subheader('Suggested markets')
+    st.caption('These markets contain coordinates for placements outside the selected DMAs. '
+               'A placement on a shared boundary can count toward more than one market.')
+    st.dataframe([{'Suggested DMA':dma_names[code],'Placements':count}
+                  for code,count in sorted(suggested_additions.items(),key=lambda item:(-item[1],dma_names[item[0]]))],
+                 hide_index=True)
+    st.caption('New markets use 500 ft. Previously applied distances stay as set.')
+    st.button('Add suggested markets and rerun screening',
+              on_click=add_suggested_markets_and_rerun,args=(tuple(suggested_additions),))
 if st.session_state['stage6_errors']:
     st.error('State data errors: '+ '; '.join(f'{state_names[k]}: {v}' for k,v in st.session_state['stage6_errors'].items()))
 priority=[x for x in ('screening_status','distance_ft','nearby_facility','facility_category','matched_dma','applied_distance_ft','Unit #','Location Description','screening_notes') if x in res]
