@@ -345,7 +345,7 @@ MARKET_PICKER_HTML=r'''<!doctype html><html><head><meta charset="utf-8"><style>
 .panel{background:linear-gradient(135deg,#182638,#101b29);border:1px solid #334155;border-top:3px solid #2dd4a6;border-radius:14px;padding:18px 20px;color:#eef3f8}
 .heading{font-size:16px;font-weight:700}.sub{color:#aebdcd;font-size:12px;margin:6px 0 14px}
 #selected{max-height:330px;overflow:auto}.market-row{display:flex;align-items:center;gap:14px;padding:10px 0;border-bottom:1px solid #33415588}
-.market-name{flex:1;min-width:0;font-size:14px;font-weight:500;line-height:1.4}.distance-group{display:flex;border:1px solid #46566b;border-radius:7px;overflow:hidden;flex-shrink:0}
+.market-detail{display:block;font-size:12px;color:#aebdcd;margin-top:5px;font-weight:400}.unmatched-row{border-left:3px solid #ffd166;padding-left:10px}.dma-select{max-width:48%;background:#101b29;color:#eef3f8;border:1px solid #526176;border-radius:6px;padding:8px}.market-name{flex:1;min-width:0;font-size:14px;font-weight:500;line-height:1.4}.distance-group{display:flex;border:1px solid #46566b;border-radius:7px;overflow:hidden;flex-shrink:0}
 .distance-group button{font:inherit;padding:7px 12px;background:transparent;color:#b9c6d5;border:0;cursor:pointer;min-width:60px}
 .distance-group button.active{background:#20bda9;color:#052820;font-weight:700}.remove{background:transparent;color:#9eafc3;border:0;font-size:21px;cursor:pointer;padding:3px 6px}.remove:hover{color:#ff777e}
 #add{border:0;background:transparent;color:#2dd4a6;padding:12px 0 5px;font:inherit;cursor:pointer;text-align:left}
@@ -357,9 +357,9 @@ MARKET_PICKER_HTML=r'''<!doctype html><html><head><meta charset="utf-8"><style>
 .footer{display:flex;flex-direction:column;align-items:flex-start;gap:12px;margin-top:15px}.footer span{font-size:12px;color:#aebdcd}
 #apply{background:#20bda9;color:#052820;border:0;border-radius:7px;padding:10px 16px;font:600 13px Arial,sans-serif;cursor:pointer}#apply:disabled{opacity:.45;cursor:default}
 @media(max-width:520px){.panel{padding:14px}.market-row{gap:6px}.market-name{font-size:12px}.distance-group button{padding:7px 8px;min-width:48px}}
-</style></head><body><div class="panel" id="panel"><div class="heading">Campaign markets &amp; distances</div><div class="sub">Confirm your detected markets. Use 500′ by default or select a 250′ exception.</div><div id="selected"></div><button id="add" type="button">+ Add market</button><div id="searchbox" hidden><input id="search" type="search" aria-label="Search markets" placeholder="Type a market name…" autocomplete="off"><div id="results" role="listbox" aria-label="Available markets"></div></div><div class="footer"><span id="summary"></span><button id="apply" type="button">Run Nationwide Screening</button></div></div>
+</style></head><body><div class="panel" id="panel"><div class="heading">Campaign markets &amp; distances</div><div class="sub">Review grid markets and placement counts here. Assign any unmatched market, then choose 500′ or a 250′ exception.</div><div id="selected"></div><button id="add" type="button">+ Add market</button><div id="searchbox" hidden><input id="search" type="search" aria-label="Search markets" placeholder="Type a market name…" autocomplete="off"><div id="results" role="listbox" aria-label="Available markets"></div></div><div class="footer"><span id="summary"></span><button id="apply" type="button">Run Nationwide Screening</button></div></div>
 <script>
-let options=[],rules={},initialized=false,lastHeight=0;
+let options=[],rules={},marketRows=[],assignments={},initialized=false,lastHeight=0;
 const selected=document.getElementById('selected'),add=document.getElementById('add'),searchbox=document.getElementById('searchbox'),search=document.getElementById('search'),results=document.getElementById('results'),summary=document.getElementById('summary'),apply=document.getElementById('apply');
 function send(type,extra){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*');}
 function resize(){const height=Math.ceil(document.getElementById('panel').getBoundingClientRect().height)+6;if(height!==lastHeight){lastHeight=height;send('streamlit:setFrameHeight',{height:height});}}
@@ -370,26 +370,43 @@ function filter(){
  if(!matches.length){const empty=document.createElement('div');empty.className='option';empty.textContent='No matching markets';results.appendChild(empty);}
  resize();
 }
+function assignedCode(item){return assignments[item.market]||item.code;}
 function render(){
  selected.replaceChildren();
+ const unresolved=marketRows.filter(item=>!(assignedCode(item) in rules));
+ unresolved.forEach(item=>{
+  const row=document.createElement('div');row.className='market-row unmatched-row';
+  const name=document.createElement('div');name.className='market-name';name.textContent=item.market;
+  const detail=document.createElement('span');detail.className='market-detail';detail.textContent=item.count+' placement'+(item.count===1?'':'s')+' · DMA not selected';name.appendChild(detail);row.appendChild(name);
+  const select=document.createElement('select');select.className='dma-select';select.setAttribute('aria-label','Assign DMA for '+item.market);
+  const placeholder=document.createElement('option');placeholder.value='';placeholder.textContent='Select DMA…';select.appendChild(placeholder);
+  options.forEach(option=>{const choice=document.createElement('option');choice.value=option.value;choice.textContent=option.label;select.appendChild(choice);});
+  select.onchange=()=>{if(select.value){assignments[item.market]=select.value;if(!(select.value in rules))rules[select.value]=500;render();}};
+  row.appendChild(select);selected.appendChild(row);
+ });
  options.filter(option=>option.value in rules).forEach(option=>{
   const row=document.createElement('div');row.className='market-row';
-  const name=document.createElement('div');name.className='market-name';name.textContent=option.label;row.appendChild(name);
+  const name=document.createElement('div');name.className='market-name';name.textContent=option.label;
+  const sources=marketRows.filter(item=>assignedCode(item)===option.value);
+  const detail=document.createElement('span');detail.className='market-detail';
+  const count=sources.reduce((sum,item)=>sum+item.count,0);
+  detail.textContent=sources.length ? count+' placement'+(count===1?'':'s')+' · Grid: '+sources.map(item=>item.market+(assignments[item.market]?' (assigned)':'')).join('; ') : 'Manually added market';
+  name.appendChild(detail);row.appendChild(name);
   const group=document.createElement('div');group.className='distance-group';group.setAttribute('role','group');group.setAttribute('aria-label',option.label+' distance');
   [500,250].forEach(distance=>{const button=document.createElement('button');button.type='button';button.className=rules[option.value]===distance?'active':'';button.textContent=distance+'′';button.setAttribute('aria-pressed',String(rules[option.value]===distance));button.onclick=()=>{rules[option.value]=distance;render();};group.appendChild(button);});row.appendChild(group);
-  const remove=document.createElement('button');remove.className='remove';remove.type='button';remove.textContent='×';remove.setAttribute('aria-label','Remove '+option.label);remove.onclick=()=>{delete rules[option.value];render();};row.appendChild(remove);selected.appendChild(row);
+  const remove=document.createElement('button');remove.className='remove';remove.type='button';remove.textContent='×';remove.setAttribute('aria-label','Remove '+option.label);remove.onclick=()=>{delete rules[option.value];Object.keys(assignments).forEach(market=>{if(assignments[market]===option.value)delete assignments[market];});render();};row.appendChild(remove);selected.appendChild(row);
  });
  if(!Object.keys(rules).length){const empty=document.createElement('div');empty.id='empty';empty.textContent='No markets selected. Add a market below.';selected.appendChild(empty);}
- const count=Object.keys(rules).length;summary.textContent=count+' market'+(count===1?'':'s')+' selected';apply.disabled=count===0;
+ const count=Object.keys(rules).length;summary.textContent=count+' market'+(count===1?'':'s')+' selected'+(unresolved.length?' · '+unresolved.length+' grid market(s) need a DMA selection':'');apply.disabled=count===0;
  if(!searchbox.hidden)filter();else resize();
 }
 add.onclick=()=>{searchbox.hidden=!searchbox.hidden;add.textContent=searchbox.hidden?'+ Add market':'− Close search';if(!searchbox.hidden){filter();search.focus();}resize();};
 search.addEventListener('input',filter);
 search.addEventListener('keydown',event=>{if(event.key==='Escape'){searchbox.hidden=true;add.textContent='+ Add market';resize();}if(event.key==='Enter'){event.preventDefault();const first=results.querySelector('button');if(first)first.click();}});
-apply.onclick=()=>send('streamlit:setComponentValue',{value:{distances:Object.assign({},rules),revision:Date.now()},dataType:'json'});
+apply.onclick=()=>send('streamlit:setComponentValue',{value:{distances:Object.assign({},rules),assignments:Object.assign({},assignments),revision:Date.now()},dataType:'json'});
 window.addEventListener('message',event=>{
  if(event.source!==window.parent||!event.data||event.data.type!=='streamlit:render')return;
- if(!initialized){options=event.data.args.options||[];const initial=event.data.args.initial_rules||{};options.forEach(option=>{if(option.value in initial)rules[option.value]=initial[option.value]===250?250:500;});initialized=true;render();}else resize();
+ if(!initialized){options=event.data.args.options||[];marketRows=event.data.args.market_rows||[];assignments=Object.assign({},event.data.args.initial_assignments||{});const initial=event.data.args.initial_rules||{};options.forEach(option=>{if(option.value in initial)rules[option.value]=initial[option.value]===250?250:500;});initialized=true;render();}else resize();
 });
 window.addEventListener('resize',resize);
 send('streamlit:componentReady',{apiVersion:1});
@@ -400,7 +417,7 @@ send('streamlit:componentReady',{apiVersion:1});
 def market_picker_component():
     directory=Path(tempfile.mkdtemp(prefix='lda_market_picker_'))
     (directory/'index.html').write_text(MARKET_PICKER_HTML,encoding='utf-8')
-    return components.declare_component('lda_campaign_panel_v3',path=str(directory))
+    return components.declare_component('lda_campaign_panel_v4',path=str(directory))
 
 
 @st.cache_resource(show_spinner=False, max_entries=1)
@@ -443,23 +460,21 @@ if st.session_state.get('stage6_inventory_context')!=settings_context:
     st.session_state['stage6_dma_selection']=suggested_labels
     st.session_state['stage6_dma_distances']={code:500 for code in dma_names}
     st.session_state['stage6_inventory_context']=settings_context
-st.caption(f'Automatically selected {len(suggested_labels)} DMA(s) from grid market columns. Confirm or edit below.')
-unmatched=[r for r in market_review if r['Match']!='Matched']
-if unmatched:
-    count=sum(r['Placements'] for r in unmatched)
-    st.warning(f'{count:,} placement(s) have missing, ambiguous or unrecognized market names. Review the matches and select any additional DMAs manually.')
-with st.expander('Review market detection',expanded=bool(unmatched)):
-    st.dataframe(pd.DataFrame(market_review),hide_index=True)
-    st.caption('Matching uses market names/codes, not geocoded addresses. Placement coordinates are still checked against your confirmed DMA selection.')
-
-st.markdown('**2. Campaign settings**')
+    st.session_state['stage6_market_assignments']={}
+st.markdown('**2. Markets & screening distances**')
 initial_selection=st.session_state.get('stage6_dma_selection',suggested_labels)
 initial_rules={labels[label]:st.session_state['stage6_dma_distances'].get(labels[label],500)
                for label in initial_selection if label in labels}
+market_rows=[]
+for item in market_review:
+    codes,_=suggest_market_dmas(pd.Series([item['Grid market']]),dma_names)
+    market_rows.append({'market':item['Grid market'],'count':item['Placements'],
+                        'code':next(iter(codes)) if len(codes)==1 else None})
 panel_value=market_picker_component()(
     options=[{'value':code,'label':dma_names[code]} for code in labels.values()],
-    initial_rules=initial_rules,
-    key='campaign_panel_v3_'+hashlib.sha256(str(settings_context).encode()).hexdigest()[:16]
+    initial_rules=initial_rules,market_rows=market_rows,
+    initial_assignments=st.session_state.get('stage6_market_assignments',{}),
+    key='campaign_panel_v4_'+hashlib.sha256(str(settings_context).encode()).hexdigest()[:16]
         +'_'+str(st.session_state.get('stage6_panel_revision',0)),default=None)
 run_clicked=False
 if panel_value is not None:
@@ -470,6 +485,13 @@ if panel_value is not None:
         if not isinstance(proposed,dict) or not proposed:raise ValueError('Select at least one market.')
         if any(code not in dma_names or type(value) is not int or value not in (250,500)
                for code,value in proposed.items()):raise ValueError('Invalid market distance settings.')
+        assignments=panel_value.get('assignments',{})
+        source_markets={item['market'] for item in market_rows}
+        if not isinstance(assignments,dict) or any(
+                market not in source_markets or code not in proposed
+                for market,code in assignments.items()):
+            raise ValueError('Invalid grid market assignment.')
+        st.session_state['stage6_market_assignments']=assignments
         selected_labels=[label for label,code in labels.items() if code in proposed]
         dma_distances={labels[label]:proposed[labels[label]] for label in selected_labels}
         st.session_state['stage6_dma_selection']=selected_labels
@@ -482,7 +504,6 @@ if 'stage6_settings' not in st.session_state:
     st.info('Confirm your markets and distances, then click Run Nationwide Screening.');reset_control();st.stop()
 applied=st.session_state['stage6_settings']
 selected_labels=applied['labels'];dma_distances=applied['distances']
-st.caption('Applied distances: '+ ' · '.join(f'{dma_names[code]}: {distance} ft' for code,distance in dma_distances.items()))
 st.caption('Each placement uses its matched DMA distance plus a 50 ft review band. Grid-market fallbacks are flagged for review.')
 dma_geoms={labels[label]:selected_dma_geometry(REPO,idx_id,TOKEN,labels[label]) for label in selected_labels}
 
@@ -948,7 +969,8 @@ try:
     grid_codes={}
     for value in df[inventory_meta['market']].fillna('').astype(str).unique():
         matches,_=suggest_market_dmas(pd.Series([value]),dma_names)
-        grid_codes[value]=next(iter(matches)) if len(matches)==1 else None
+        grid_codes[value]=st.session_state.get('stage6_market_assignments',{}).get(value.strip() or '(blank)',
+            next(iter(matches)) if len(matches)==1 else None)
     for _,r in df.iterrows():
         rule=None
         try:
@@ -976,7 +998,7 @@ try:
     st.caption(f'Placements: {len(df):,} · Required state datasets: {", ".join(state_names[s] for s in sorted(all_needed)) or "none"}')
     if missing:st.error('Missing state snapshots: '+', '.join(state_names[s] for s in missing)+'. Placements requiring these states will be marked Unable to Locate.')
 
-    fingerprint=('dma-fallback-v2',inventory_key,idx_id,tuple(sorted(dma_distances.items())),tuple(sorted((k,v['tag']) for k,v in available.items())))
+    fingerprint=('unified-markets-v1',inventory_key,idx_id,tuple(sorted(st.session_state.get('stage6_market_assignments',{}).items())),tuple(sorted(dma_distances.items())),tuple(sorted((k,v['tag']) for k,v in available.items())))
     if run_clicked:
         start=time.perf_counter(); datasets={};load_errors={}
         suggested_additions=Counter()
