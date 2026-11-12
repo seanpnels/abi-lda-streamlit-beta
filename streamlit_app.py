@@ -578,6 +578,14 @@ def placement_pin_title(row, number):
     return f'Placement {number}'
 
 
+def facility_coordinates_html(lat, lon):
+    viewpoint=f'{float(lat):.7f}%2C{float(lon):.7f}'
+    url=f'https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={viewpoint}'
+    return ('<br><a href="'+html.escape(url,quote=True)+'" target="_blank" '
+            'rel="noopener noreferrer" style="display:inline-block;margin:6px 0;'
+            'color:#1565c0;text-decoration:underline;">Open in Street View ↗</a>')
+
+
 def additional_college_pins(map_rows, facility_hits):
     primary = {(str(row['osm_id']), float(row['facility_latitude']), float(row['facility_longitude']))
                for _, _, row in map_rows[:1000]
@@ -596,7 +604,7 @@ def additional_college_pins(map_rows, facility_hits):
         records.append({
             'position': {'lat': lat, 'lng': lon}, 'title': title,
             'popup': f'<b>{html.escape(title)}</b><br>Possible college or university — verify.'
-                     f'<br>OSM: {html.escape(osm_id)}',
+                     f'<br>OSM: {html.escape(osm_id)}'+facility_coordinates_html(lat,lon),
         })
     return records
 
@@ -641,7 +649,8 @@ def dma_osm_pin_records(map_rows):
             title = site['name'].strip() or 'Unnamed OSM site'
             popup = (f'<b>{html.escape(title)}</b><br>'
                      + html.escape(', '.join(site['cats']))
-                     + '<br>OSM: ' + html.escape(site['osm_id']))
+                     + '<br>OSM: ' + html.escape(site['osm_id'])
+                     + facility_coordinates_html(lat,lon))
             records.append({'position': {'lat': lat, 'lng': lon}, 'title': title, 'popup': popup})
     return records, unavailable
 
@@ -669,6 +678,7 @@ def google_review_map_records(rows):
                 'popup':(f'<b>Flagged facility for placement {number}</b><br>'+html.escape(name)
                          +'<br>'+html.escape(str(row['facility_category']))
                          +'<br>OSM: '+html.escape(str(row['osm_id']))
+                         +facility_coordinates_html(facility_lat,facility_lon)
                          +'<br>Mapped facility location; measure manually.')}
         records.append(record)
     return records
@@ -1176,6 +1186,7 @@ if map_rows:
                 facility_popup=(f'<b>Flagged facility for placement {row_number}</b><br>'
                     +html.escape(name)+'<br>'+html.escape(str(r['facility_category']))
                     +'<br>OSM: '+html.escape(str(r['osm_id']))
+                    +facility_coordinates_html(facility_lat,facility_lon)
                     +'<br>Pin marks mapped facility location; measure manually.')
                 folium.Marker([float(facility_lat),float(facility_lon)],
                     icon=folium.Icon(color='orange' if r.get('facility_category') == 'university' else color,
