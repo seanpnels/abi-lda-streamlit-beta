@@ -357,7 +357,7 @@ MARKET_PICKER_HTML=r'''<!doctype html><html><head><meta charset="utf-8"><style>
 .footer{display:flex;flex-direction:column;align-items:flex-start;gap:12px;margin-top:15px}.footer span{font-size:12px;color:#aebdcd}
 #apply{background:#20bda9;color:#052820;border:0;border-radius:7px;padding:10px 16px;font:600 13px Arial,sans-serif;cursor:pointer}#apply:disabled{opacity:.45;cursor:default}
 @media(max-width:520px){.panel{padding:14px}.market-row{gap:6px}.market-name{font-size:12px}.distance-group button{padding:7px 8px;min-width:48px}}
-</style></head><body><div class="panel" id="panel"><div class="heading">Campaign markets &amp; distances</div><div class="sub">Confirm your detected markets. Use 500′ by default or select a 250′ exception.</div><div id="selected"></div><button id="add" type="button">+ Add market</button><div id="searchbox" hidden><input id="search" type="search" aria-label="Search markets" placeholder="Type a market name…" autocomplete="off"><div id="results" role="listbox" aria-label="Available markets"></div></div><div class="footer"><span id="summary"></span><button id="apply" type="button">Apply campaign settings</button></div></div>
+</style></head><body><div class="panel" id="panel"><div class="heading">Campaign markets &amp; distances</div><div class="sub">Confirm your detected markets. Use 500′ by default or select a 250′ exception.</div><div id="selected"></div><button id="add" type="button">+ Add market</button><div id="searchbox" hidden><input id="search" type="search" aria-label="Search markets" placeholder="Type a market name…" autocomplete="off"><div id="results" role="listbox" aria-label="Available markets"></div></div><div class="footer"><span id="summary"></span><button id="apply" type="button">Run Nationwide Screening</button></div></div>
 <script>
 let options=[],rules={},initialized=false,lastHeight=0;
 const selected=document.getElementById('selected'),add=document.getElementById('add'),searchbox=document.getElementById('searchbox'),search=document.getElementById('search'),results=document.getElementById('results'),summary=document.getElementById('summary'),apply=document.getElementById('apply');
@@ -400,7 +400,7 @@ send('streamlit:componentReady',{apiVersion:1});
 def market_picker_component():
     directory=Path(tempfile.mkdtemp(prefix='lda_market_picker_'))
     (directory/'index.html').write_text(MARKET_PICKER_HTML,encoding='utf-8')
-    return components.declare_component('lda_campaign_panel_v2',path=str(directory))
+    return components.declare_component('lda_campaign_panel_v3',path=str(directory))
 
 
 @st.cache_resource(show_spinner=False, max_entries=1)
@@ -415,10 +415,22 @@ class OutsideSelectedDMA(ValueError):
     pass
 
 
-def placement_dma_rule(lon,lat,chosen,geometries,distances,names):
-    matches=[code for code in chosen if geometries[code].covers(Point(lon,lat))]
-    if not matches:raise OutsideSelectedDMA('Outside selected DMA boundary')
-    return {'dma':'; '.join(names[code] for code in matches),
+def placement_dma_rule(lon,lat,chosen,geometries,distances,names,grid_code=None,national_lookup=None):
+    point=Point(lon,lat)
+    matches=[code for code in chosen if geometries[code].covers(point)]
+    if not matches:
+        # Never let a grid label override a coordinate match to another market.
+        codes,tree=national_lookup()
+        national_matches=[codes[int(i)] for i in tree.query(point,predicate='covered_by')]
+        if national_matches:
+            raise OutsideSelectedDMA('Coordinates match an unselected DMA: '+
+                                     '; '.join(names[code] for code in national_matches))
+        if grid_code in chosen:
+            return {'dma':names[grid_code],'distance':distances[grid_code],
+                    'source':'Grid market fallback',
+                    'note':'No DMA boundary matched the coordinates. Used the grid market; verify DMA and distance before clearance.'}
+        raise OutsideSelectedDMA('No DMA boundary matched the coordinates; grid market is missing, ambiguous, or not selected.')
+    return {'source':'Coordinates','dma':'; '.join(names[code] for code in matches),
             'distance':max(distances[code] for code in matches),
             'note':'Multiple DMA boundaries matched; larger distance applied.' if len(matches)>1 else ''}
 
@@ -447,10 +459,13 @@ initial_rules={labels[label]:st.session_state['stage6_dma_distances'].get(labels
 panel_value=market_picker_component()(
     options=[{'value':code,'label':dma_names[code]} for code in labels.values()],
     initial_rules=initial_rules,
-    key='campaign_panel_v2_'+hashlib.sha256(str(settings_context).encode()).hexdigest()[:16]
+    key='campaign_panel_v3_'+hashlib.sha256(str(settings_context).encode()).hexdigest()[:16]
         +'_'+str(st.session_state.get('stage6_panel_revision',0)),default=None)
+run_clicked=False
 if panel_value is not None:
     try:
+        submission=(settings_context,st.session_state.get('stage6_panel_revision',0),panel_value['revision'])
+        run_clicked=submission!=st.session_state.get('stage6_last_submission')
         proposed=panel_value['distances']
         if not isinstance(proposed,dict) or not proposed:raise ValueError('Select at least one market.')
         if any(code not in dma_names or type(value) is not int or value not in (250,500)
@@ -460,14 +475,15 @@ if panel_value is not None:
         st.session_state['stage6_dma_selection']=selected_labels
         st.session_state['stage6_dma_distances'].update(dma_distances)
         st.session_state['stage6_settings']={'labels':selected_labels,'distances':dma_distances}
+        st.session_state['stage6_last_submission']=submission
     except (KeyError,TypeError,ValueError) as exc:
         st.error(f'Campaign settings: {exc}');st.stop()
 if 'stage6_settings' not in st.session_state:
-    st.info('Confirm your markets and distances, then click Apply campaign settings.');reset_control();st.stop()
+    st.info('Confirm your markets and distances, then click Run Nationwide Screening.');reset_control();st.stop()
 applied=st.session_state['stage6_settings']
 selected_labels=applied['labels'];dma_distances=applied['distances']
 st.caption('Applied distances: '+ ' · '.join(f'{dma_names[code]}: {distance} ft' for code,distance in dma_distances.items()))
-st.caption('Each placement uses its coordinate-matched DMA distance plus a 50 ft review band.')
+st.caption('Each placement uses its matched DMA distance plus a 50 ft review band. Grid-market fallbacks are flagged for review.')
 dma_geoms={labels[label]:selected_dma_geometry(REPO,idx_id,TOKEN,labels[label]) for label in selected_labels}
 
 AMENITIES={'school':'school','kindergarten':'daycare','childcare':'daycare','place_of_worship':'worship','college':'university','university':'university'}
@@ -913,19 +929,24 @@ def add_suggested_markets_and_rerun(codes):
     st.session_state['stage6_rerun_requested'] = True
 
 
-run_clicked=st.button('Run Nationwide Screening',type='primary')
 run_clicked=st.session_state.pop('stage6_rerun_requested',False) or run_clicked
 progress=st.status('Screening in progress… Checking placement coordinates',state='running',expanded=True) if run_clicked else None
 try:
     chosen=[labels[x] for x in selected_labels]
     points=[]; point_rules=[];all_needed=set();valid=[]
     outside_points=[]
+    grid_codes={}
+    for value in df[inventory_meta['market']].fillna('').astype(str).unique():
+        matches,_=suggest_market_dmas(pd.Series([value]),dma_names)
+        grid_codes[value]=next(iter(matches)) if len(matches)==1 else None
     for _,r in df.iterrows():
         rule=None
         try:
             lat=float(r[lat_col]);lon=float(r[lon_col]);
             if not (math.isfinite(lat) and math.isfinite(lon) and -90<=lat<=90 and -180<=lon<=180):raise ValueError('Invalid coordinate')
-            rule=placement_dma_rule(lon,lat,chosen,dma_geoms,dma_distances,dma_names)
+            rule=placement_dma_rule(lon,lat,chosen,dma_geoms,dma_distances,dma_names,
+                                    grid_codes.get(str(r[inventory_meta['market']])),
+                                    lambda:nationwide_dma_lookup(REPO,idx_id,TOKEN))
             needs=needed_states(lon,lat)
             if not needs:raise ValueError('No matching state geometry / unsupported territory')
             points.append((lat,lon,needs,''));all_needed.update(needs);valid.append((lat,lon))
@@ -936,7 +957,7 @@ try:
         except Exception as exc:points.append((None,None,[],str(exc)))
         point_rules.append(rule)
 
-    if progress:progress.write(f'Coordinate checks complete: {len(valid):,} of {len(df):,} placements located in the selected DMAs.')
+    if progress:progress.write(f'Coordinate checks complete: {len(valid):,} of {len(df):,} placements ready for screening.')
     available={};missing=[]
     for slug in sorted(all_needed):
         release=latest_asset(rels,f'stage6-osm-{slug}-','facilities.geojsonseq.gz')
@@ -945,7 +966,7 @@ try:
     st.caption(f'Placements: {len(df):,} · Required state datasets: {", ".join(state_names[s] for s in sorted(all_needed)) or "none"}')
     if missing:st.error('Missing state snapshots: '+', '.join(state_names[s] for s in missing)+'. Placements requiring these states will be marked Unable to Locate.')
 
-    fingerprint=('university-review-v1',inventory_key,idx_id,tuple(sorted(dma_distances.items())),tuple(sorted((k,v['tag']) for k,v in available.items())))
+    fingerprint=('dma-fallback-v2',inventory_key,idx_id,tuple(sorted(dma_distances.items())),tuple(sorted((k,v['tag']) for k,v in available.items())))
     if run_clicked:
         start=time.perf_counter(); datasets={};load_errors={}
         suggested_additions=Counter()
@@ -979,15 +1000,17 @@ try:
             rec={'screening_status':'GRAY — Unable to screen','distance_ft':None,'nearby_facility':'',
                  'facility_category':'','osm_id':'','geometry_quality':'',
                  'facility_latitude':None,'facility_longitude':None,'screening_notes':'Human review required',
-                 'state_snapshots':'','matched_dma':'','applied_distance_ft':None}
+                 'state_snapshots':'','matched_dma':'','dma_match_source':'','applied_distance_ft':None}
             rule=point_rules[screening_row-2]
             if rule:
                 restriction=rule['distance']
-                rec.update({'matched_dma':rule['dma'],'applied_distance_ft':restriction})
+                rec.update({'matched_dma':rule['dma'],'dma_match_source':rule['source'],
+                            'applied_distance_ft':restriction})
+                if rule['note']:rec['screening_notes']+=' '+rule['note']
             if error:rec['screening_notes']=error;results.append(rec);continue
             bad=[s for s in needs if s not in datasets]
             if bad:
-                rec['screening_notes']='Missing/stale/failed state coverage: '+', '.join(state_names[s] for s in bad)
+                rec['screening_notes']='Missing/stale/failed state coverage: '+', '.join(state_names[s] for s in bad)+(' '+rule['note'] if rule['note'] else '')
                 results.append(rec);continue
             project=local_projection(lon,lat); p=Point(0,0)
             radius_m=(restriction+50)*.3048;near=[]
@@ -1006,7 +1029,7 @@ try:
             near.sort(key=lambda item:item[0])
             red_trigger=next((item for item in near if facility_triggers_red(*item, restriction)),None)
             if red_trigger:status='RED — Potential conflict'
-            elif near:status='YELLOW — Review required'
+            elif near or rule['source']=='Grid market fallback':status='YELLOW — Review required'
             else:status='GREEN — No detected conflict'
             trigger=red_trigger or (near[0] if near else None)
             rec['screening_status']=status
@@ -1081,7 +1104,7 @@ if suggested_additions:
                   on_click=add_suggested_markets_and_rerun,args=(tuple(suggested_additions),))
 if st.session_state['stage6_errors']:
     st.error('State data errors: '+ '; '.join(f'{state_names[k]}: {v}' for k,v in st.session_state['stage6_errors'].items()))
-priority=[x for x in ('screening_status','distance_ft','nearby_facility','facility_category','matched_dma','applied_distance_ft','Unit #','Location Description','screening_notes') if x in res]
+priority=[x for x in ('screening_status','distance_ft','nearby_facility','facility_category','matched_dma','dma_match_source','applied_distance_ft','Unit #','Location Description','screening_notes') if x in res]
 res_display=res.copy()
 res_display['screening_status']=res_display['screening_status'].map(display_status)
 a,b=st.columns(2)
